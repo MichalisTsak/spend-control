@@ -511,6 +511,34 @@ textarea.copy-box { width: 100%; height: auto; min-height: 150px; margin-top: 10
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }
 @media print { .topbar, .fab, #toasts, #banners, .o-entry { display: none !important; } body { background: #fff; } }
 
+/* ---------- review, accounts, import matches ---------- */
+.toggle.attn { border-color: color-mix(in srgb, var(--warn) 60%, var(--rule)); color: var(--t-warn); background: color-mix(in srgb, var(--warn) 8%, var(--field)); }
+.rv-sec + .rv-sec { margin-top: 22px; }
+.rv-sec h3 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+.rv-pair { border: 1px solid var(--rule); border-radius: 10px; padding: 4px 12px 10px; margin-top: 10px; background: var(--field); }
+.rv-row { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 7px 0; }
+.rv-row + .rv-row { border-top: 1px solid var(--rule); }
+.rv-note { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.rv-sub { display: block; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.rv-amt { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rv-amt.in { color: var(--t-good); }
+.rv-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.rv-all { margin-top: 12px; }
+.imp-match { margin: 0 0 12px; }
+.imp-match label.check { align-items: flex-start; }
+.imp-match label.check input { margin-top: 3px; flex: none; }
+.sub-h { font-size: 13.5px; font-weight: 600; margin: 16px 0 2px; }
+details.fold[open] > summary { margin-bottom: 4px; }
+.imp-grid input[type="checkbox"], .imp-match input[type="checkbox"] { width: 16px; flex: none; }
+.imp-grid label.check { gap: 8px; }
+@media (max-width: 760px) {
+  .rv-pair { padding: 2px 10px 10px; }
+  .rv-actions .btn { flex: 1 1 auto; }
+}
+.imp-top { margin-bottom: 0; }
+.imp-cols { margin-top: 14px; }
+.imp-cols > summary { margin-top: 0; }
+
 </style>
 </head>
 <body>
@@ -803,6 +831,10 @@ salary: μισθοδοσία, μισθός, salary, payroll, αποδοχές
    State, saving, rules, recurring payments and the month arithmetic.
    Amounts are whole cents (integers). Every entry has a positive amount and
    a direction: 'expense' (money out) or 'income' (money in).
+
+   Every record carries `upd`, the time it last changed, and deletions are
+   remembered in `state.deleted`. That is what lets two devices merge their
+   backups instead of one overwriting the other.
    ========================================================================= */
 let state = null;
 let storageOK = true;
@@ -810,6 +842,7 @@ let loadProblem = null;
 let catIndex = new Map();
 let compiledRules = null;
 let commitGen = 0;
+let dataRev = 0;                 // bumps on every save; used to cache derived lists
 
 function defaultLocale() {
   const l = (navigator.language || 'en').toLowerCase();
@@ -831,16 +864,22 @@ function parseRuleText(txt) {
   return out;
 }
 
+const DELETED_KINDS = ['tx', 'cat', 'rec', 'rule', 'acct'];
 function freshState() {
   return {
-    version: 1,
-    settings: { currency: 'EUR', locale: defaultLocale(), limit: null, theme: 'auto', lastBackup: null, changes: 0 },
+    version: 2,
+    settings: { currency: 'EUR', locale: defaultLocale(), limit: null, limitUpd: 0, theme: 'auto', lastBackup: null, changes: 0, savedAt: 0, clock: 0 },
     categories: DEFAULT_CATEGORIES.map(c => ({ ...c, budget: null })),
-    tx: [], recurring: [], rules: parseRuleText(DEFAULT_RULES), imports: [], demo: null,
+    tx: [], recurring: [], rules: parseRuleText(DEFAULT_RULES), imports: [], accounts: [],
+    deleted: { tx: {}, cat: {}, rec: {}, rule: {}, acct: {} }, dismissed: [], demo: null,
   };
 }
 
 const posInt = v => { const n = Math.round(Number(v)); return Number.isFinite(n) && n > 0 ? n : null; };
+const posNum = v => (Number.isFinite(v) && v > 0 ? v : 0);
+const withUpd = (obj, src) => { if (posNum(src.upd)) obj.upd = src.upd; return obj; };
+/* When a record last changed. */
+const stampOf = x => x.upd || x.created || 0;
 
 /* Validates and repairs anything loaded from storage or a backup file. */
 function normalizeState(raw) {
@@ -852,24 +891,36 @@ function normalizeState(raw) {
   if (typeof rs.currency === 'string' && /^[A-Z]{3}$/.test(rs.currency)) st.settings.currency = rs.currency;
   if (typeof rs.locale === 'string' && rs.locale.length < 20) st.settings.locale = rs.locale;
   st.settings.limit = posInt(rs.limit);
+  st.settings.limitUpd = posNum(rs.limitUpd);
   st.settings.theme = ['auto', 'light', 'dark'].includes(rs.theme) ? rs.theme : 'auto';
   st.settings.lastBackup = typeof rs.lastBackup === 'string' ? rs.lastBackup : null;
   st.settings.changes = Number.isFinite(rs.changes) ? rs.changes : 0;
+  st.settings.savedAt = posNum(rs.savedAt);
+  st.settings.clock = posNum(rs.clock);
 
   const ids = new Set();
   st.categories = [];
   for (const c of raw.categories) {
     if (!c || typeof c.id !== 'string' || !c.id || ids.has(c.id)) continue;
     ids.add(c.id);
-    st.categories.push({
+    st.categories.push(withUpd({
       id: c.id,
       name: String(c.name ?? '').trim().slice(0, 60) || 'Unnamed',
       icon: String(c.icon ?? '').trim().slice(0, 8) || '•',
       kind: c.id === 'uncat' ? 'auto' : (['expense', 'income', 'transfer'].includes(c.kind) ? c.kind : 'expense'),
       budget: c.id === 'uncat' ? null : posInt(c.budget),
-    });
+    }, c));
   }
   if (!ids.has('uncat')) { st.categories.push({ id: 'uncat', name: 'Uncategorized', icon: '❔', kind: 'auto', budget: null }); ids.add('uncat'); }
+
+  const acctIds = new Set();
+  for (const a of Array.isArray(raw.accounts) ? raw.accounts : []) {
+    if (!a || typeof a.id !== 'string' || !a.id || acctIds.has(a.id)) continue;
+    const name = String(a.name ?? '').trim().slice(0, 40);
+    if (!name) continue;
+    acctIds.add(a.id);
+    st.accounts.push(withUpd({ id: a.id, name, sigs: (Array.isArray(a.sigs) ? a.sigs : []).filter(x => typeof x === 'string').slice(0, 12).map(x => x.slice(0, 400)) }, a));
+  }
 
   const txIds = new Set();
   st.tx = [];
@@ -877,87 +928,243 @@ function normalizeState(raw) {
     if (!t || !isYMD(t.date)) continue;
     const amount = posInt(t.amount);
     if (!amount) continue;
+    const rid = typeof t.rid === 'string' && t.rid ? t.rid : undefined;
     let id = typeof t.id === 'string' && t.id ? t.id : uid();
+    // Payments made by a recurring item get a predictable id, so two devices agree on them.
+    if (rid && !id.startsWith('r_')) { const det = `r_${rid}_${t.date}`; if (!txIds.has(det)) id = det; }
     if (txIds.has(id)) id = uid();
     txIds.add(id);
-    st.tx.push({
+    const out = {
       id, date: t.date, amount,
       type: t.type === 'income' ? 'income' : 'expense',
       cat: ids.has(t.cat) ? t.cat : 'uncat',
       note: String(t.note ?? '').slice(0, 200),
       src: ['manual', 'import', 'recurring', 'demo'].includes(t.src) ? t.src : 'manual',
-      rid: typeof t.rid === 'string' ? t.rid : undefined,
+      rid,
       batch: typeof t.batch === 'string' ? t.batch : undefined,
       created: Number.isFinite(t.created) ? t.created : 0,
-    });
+    };
+    if (typeof t.acct === 'string' && acctIds.has(t.acct)) out.acct = t.acct;
+    if (typeof t.bk === 'string' && t.bk) out.bk = t.bk.slice(0, 300);
+    st.tx.push(withUpd(out, t));
   }
   st.recurring = [];
+  const recIds = new Set();
   for (const r of Array.isArray(raw.recurring) ? raw.recurring : []) {
     if (!r || !isYMD(r.start)) continue;
     const amount = posInt(r.amount);
     if (!amount) continue;
-    st.recurring.push({
-      id: typeof r.id === 'string' && r.id ? r.id : uid(),
+    let id = typeof r.id === 'string' && r.id ? r.id : uid();
+    if (recIds.has(id)) id = uid();
+    recIds.add(id);
+    st.recurring.push(withUpd({
+      id,
       type: r.type === 'income' ? 'income' : 'expense', amount,
       cat: ids.has(r.cat) ? r.cat : 'uncat',
       note: String(r.note ?? '').slice(0, 120),
       freq: ['monthly', 'yearly', 'weekly'].includes(r.freq) ? r.freq : 'monthly',
       start: r.start, last: isYMD(r.last) ? r.last : null, active: r.active !== false,
       src: r.src === 'demo' ? 'demo' : undefined,
-    });
+    }, r));
   }
   if (Array.isArray(raw.rules)) {
     st.rules = raw.rules
-      .filter(r => r && typeof r.match === 'string' && r.match.trim() && ids.has(r.cat))
-      .map(r => ({ id: typeof r.id === 'string' && r.id ? r.id : uid(), match: r.match.trim().slice(0, 80), cat: r.cat }));
+      .filter(r => r && typeof r.match === 'string' && r.match.trim() && ids.has(r.cat) && r.cat !== 'uncat')
+      .map(r => withUpd({ id: typeof r.id === 'string' && r.id ? r.id : uid(), match: r.match.trim().slice(0, 80), cat: r.cat }, r));
   }
   st.imports = (Array.isArray(raw.imports) ? raw.imports : [])
     .filter(b => b && typeof b.id === 'string')
-    .map(b => ({ id: b.id, file: String(b.file ?? 'statement').slice(0, 120), at: String(b.at ?? ''), count: Number(b.count) || 0 }));
+    .map(b => {
+      const out = { id: b.id, file: String(b.file ?? 'statement').slice(0, 120), at: String(b.at ?? ''), count: Number(b.count) || 0 };
+      if (typeof b.acct === 'string' && acctIds.has(b.acct)) out.acct = b.acct;
+      return out;
+    });
+  const rd = raw.deleted && typeof raw.deleted === 'object' ? raw.deleted : {};
+  const cutoff = Date.now() - 730 * DAY_MS;
+  for (const k of DELETED_KINDS) {
+    const src = rd[k] && typeof rd[k] === 'object' ? rd[k] : {};
+    for (const [id, ts] of Object.entries(src)) if (Number.isFinite(ts) && ts > cutoff) st.deleted[k][id] = ts;
+  }
+  st.dismissed = (Array.isArray(raw.dismissed) ? raw.dismissed : []).filter(x => typeof x === 'string' && x.length < 200).slice(-3000);
   if (raw.demo && typeof raw.demo === 'object') {
     st.demo = { limit: posInt(raw.demo.limit), budgets: raw.demo.budgets && typeof raw.demo.budgets === 'object' ? raw.demo.budgets : {} };
   }
   return st;
 }
 
-/* ---------- saving ---------- */
-function storageWorks() {
+/* ---------- saving: two copies on the device (IndexedDB and localStorage) ---------- */
+const store = { ls: false, lsFull: false, db: null, writing: false, pending: null, snaps: [] };
+
+function lsWorks() {
   try { const k = STORE_KEY + '/probe'; localStorage.setItem(k, '1'); localStorage.removeItem(k); return true; }
   catch { return false; }
 }
-function loadState() {
-  storageOK = storageWorks();
-  if (!storageOK) return freshState();
-  let raw = null;
-  try { raw = localStorage.getItem(STORE_KEY); } catch { storageOK = false; return freshState(); }
-  if (!raw) return freshState();
-  try { return normalizeState(JSON.parse(raw)); }
-  catch (e) {
-    try { localStorage.setItem(STORE_KEY + '/unreadable-' + Date.now(), raw); } catch { /* ignore */ }
-    loadProblem = "The data saved in this browser couldn't be read, so the app started empty. A copy of it was kept. If you have a backup file, restore it from the Data tab.";
-    return freshState();
+function idbOpen() {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = v => { if (!done) { done = true; resolve(v); } };
+    try {
+      if (typeof indexedDB === 'undefined' || !indexedDB) return finish(null);
+      const req = indexedDB.open('spend-control', 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
+        if (!db.objectStoreNames.contains('snaps')) db.createObjectStore('snaps');
+      };
+      req.onsuccess = () => { const db = req.result; db.onversionchange = () => db.close(); finish(db); };
+      req.onerror = () => finish(null);
+      req.onblocked = () => finish(null);
+      setTimeout(() => finish(null), 2500);
+    } catch { finish(null); }
+  });
+}
+function idbRun(storeName, mode, fn) {
+  return new Promise((resolve, reject) => {
+    if (!store.db) return resolve(undefined);
+    try {
+      const tx = store.db.transaction(storeName, mode);
+      const req = fn(tx.objectStore(storeName));
+      tx.oncomplete = () => resolve(req ? req.result : undefined);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    } catch (e) { reject(e); }
+  });
+}
+async function loadState() {
+  store.ls = lsWorks();
+  store.db = await idbOpen();
+  let lsRaw = null, dbRaw = null;
+  if (store.ls) { try { lsRaw = localStorage.getItem(STORE_KEY); } catch { store.ls = false; } }
+  if (store.db) {
+    try {
+      dbRaw = await idbRun('kv', 'readonly', s => s.get('state'));
+      const idx = await idbRun('kv', 'readonly', s => s.get('snapIndex'));
+      store.snaps = Array.isArray(idx) ? idx : [];
+    } catch { store.db = null; }
   }
+  storageOK = store.ls || !!store.db;
+  const parse = raw => { try { return normalizeState(JSON.parse(raw)); } catch { return null; } };
+  const a = lsRaw ? parse(lsRaw) : null;
+  const b = typeof dbRaw === 'string' && dbRaw ? parse(dbRaw) : null;
+  store.resync = !!(a || b) && !(a && b);          // one copy was missing: write both again
+  if (a && b) return (b.settings.savedAt || 0) > (a.settings.savedAt || 0) ? b : a;
+  if (a || b) return a || b;
+  if (lsRaw || dbRaw) {
+    try { localStorage.setItem(STORE_KEY + '/unreadable-' + Date.now(), lsRaw || dbRaw); } catch { /* ignore */ }
+    loadProblem = "The data saved on this device couldn't be read, so the app started empty. A copy of it was kept. If you have a backup file, bring it in from the Data tab.";
+  }
+  return freshState();
 }
 function persist() {
-  if (!storageOK) return false;
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); return true; }
-  catch {
-    storageOK = false;
-    renderBanners();
-    toast("Couldn't save: this browser's storage is full or blocked. Download a backup from the Data tab.");
-    return false;
+  dataRev++;
+  state.settings.savedAt = Date.now();
+  const json = JSON.stringify(state);
+  let ok = false;
+  if (store.ls) {
+    try { localStorage.setItem(STORE_KEY, json); ok = true; store.lsFull = false; }
+    catch {
+      store.lsFull = true;
+      if (store.db) { try { localStorage.removeItem(STORE_KEY); } catch { /* ignore */ } }   // too big for this copy; IndexedDB carries it
+    }
   }
+  if (store.db) { store.pending = json; idbFlush(); ok = true; }
+  const was = storageOK;
+  storageOK = ok;
+  if (!ok && was) {
+    renderBanners();
+    toast("Couldn't save: this browser's storage is full or blocked. Save a backup from the Data tab.");
+  }
+  if (store.db) snapSoon();
+  return ok;
 }
+async function idbFlush() {
+  if (store.writing) return;
+  store.writing = true;
+  try {
+    while (store.pending !== null) {
+      const json = store.pending;
+      store.pending = null;
+      await idbRun('kv', 'readwrite', s => s.put(json, 'state'));
+    }
+  } catch {
+    if (!store.ls || store.lsFull) { storageOK = false; renderBanners(); }
+  } finally { store.writing = false; }
+}
+
+/* ---------- snapshots: the last 14 days, kept on the device ---------- */
+const snapSoon = debounce(() => { saveSnapshot('d:' + today(), null); }, 1500);
+/* key 'd:YYYY-MM-DD' = how things stood at the end of that day; 'b:<time>' = just before a big change. */
+async function saveSnapshot(key, label, json) {
+  if (!store.db) return;
+  const body = json || JSON.stringify(state);
+  let n = state.tx.length;
+  if (json) { try { n = JSON.parse(json).tx.length; } catch { n = 0; } }
+  if (!n && key.startsWith('d:')) return;
+  try {
+    await idbRun('snaps', 'readwrite', s => s.put(body, key));
+    const list = store.snaps.filter(x => x.key !== key);
+    list.push({ key, at: Date.now(), n, label: label || null });
+    const days = list.filter(x => x.key.startsWith('d:')).sort((a, b) => b.key.localeCompare(a.key));
+    const befores = list.filter(x => x.key.startsWith('b:')).sort((a, b) => b.at - a.at);
+    const keep = [...days.slice(0, 14), ...befores.slice(0, 6)];
+    for (const x of list) if (!keep.includes(x)) { try { await idbRun('snaps', 'readwrite', s => s.delete(x.key)); } catch { /* ignore */ } }
+    store.snaps = keep;
+    await idbRun('kv', 'readwrite', s => s.put(keep, 'snapIndex'));
+  } catch { /* snapshots are a convenience; saving still works without them */ }
+}
+function snapshotBefore(label) { return saveSnapshot('b:' + Date.now(), label, JSON.stringify(state)); }
+
 function reindex() {
   catIndex = new Map(state.categories.map(c => [c.id, c]));
   compiledRules = null;
 }
 const cat = id => catIndex.get(id) || catIndex.get('uncat');
 
-/* Change state, save, redraw. With a message, shows a toast with Undo. */
-function commit(mutate, msg, extraActions = []) {
+/* ---------- change tracking ---------- */
+const txSig = t => `${t.date}|${t.amount}|${t.type}|${t.cat}|${t.note}|${t.acct || ''}|${t.bk || ''}`;
+const catSig = c => `${c.name}|${c.icon}|${c.kind}|${c.budget}`;
+const recSig = r => `${r.type}|${r.amount}|${r.cat}|${r.note}|${r.freq}|${r.start}|${r.active}`;
+const ruleKey = r => norm(r.match);
+function sigSnapshot(s) {
+  return {
+    tx: new Map(s.tx.map(t => [t.id, txSig(t)])),
+    cat: new Map(s.categories.map(c => [c.id, catSig(c)])),
+    rec: new Map(s.recurring.map(r => [r.id, recSig(r)])),
+    rule: new Map(s.rules.map(r => [ruleKey(r), r.cat])),
+    acct: new Map(s.accounts.map(a => [a.id, a.name])),
+    limit: s.settings.limit,
+  };
+}
+/* Marks what changed and remembers what was deleted. */
+function stampChanges(s, prev) {
+  const now = Math.max(Date.now(), (s.settings.clock || 0) + 1);
+  let touched = false;
+  const pass = (list, kind, keyOf, sigOf) => {
+    const seen = new Set(), before = prev[kind], gone = s.deleted[kind];
+    for (const x of list) {
+      const k = keyOf(x);
+      seen.add(k);
+      if (before.get(k) !== sigOf(x)) { x.upd = now; touched = true; }
+      if (gone[k] !== undefined) delete gone[k];
+    }
+    for (const k of before.keys()) if (!seen.has(k)) { gone[k] = now; touched = true; }
+  };
+  pass(s.tx, 'tx', t => t.id, txSig);
+  pass(s.categories, 'cat', c => c.id, catSig);
+  pass(s.recurring, 'rec', r => r.id, recSig);
+  pass(s.rules, 'rule', ruleKey, r => r.cat);
+  pass(s.accounts, 'acct', a => a.id, a => a.name);
+  if (prev.limit !== s.settings.limit) { s.settings.limitUpd = now; touched = true; }
+  if (touched) s.settings.clock = now;
+}
+
+/* Change state, save, redraw. With a message, shows a toast with Undo.
+   opts.raw: the whole state was replaced (restore, merge, erase), so nothing is stamped. */
+function commit(mutate, msg, extraActions = [], opts = {}) {
   const before = JSON.stringify(state);
+  const prev = opts.raw ? null : sigSnapshot(state);
   mutate(state);
+  if (prev) stampChanges(state, prev);
   state.settings.changes = (state.settings.changes || 0) + 1;
   reindex(); persist(); render();
   if (WEB_APP && HOSTED && !inClaude()) askPersist();
@@ -968,7 +1175,7 @@ function commit(mutate, msg, extraActions = []) {
       label: 'Undo',
       run: () => {
         if (gen !== commitGen) { toast("Can't undo: something else changed since."); return; }
-        state = JSON.parse(before); reindex(); persist(); render(); toast('Undone.');
+        state = JSON.parse(before); reindex(); nfCache.clear(); applyTheme(); persist(); render(); refreshReview(); toast('Undone.');
       },
     }, ...extraActions]);
   }
@@ -1055,7 +1262,7 @@ function occurrence(r, k) {
 }
 /* Adds every payment that has fallen due (up to and including today). */
 function runRecurring(s, now = today()) {
-  let created = 0;
+  let created = 0, have = null;
   const stamp = Date.now();
   for (const r of s.recurring) {
     if (!r.active) continue;
@@ -1063,8 +1270,12 @@ function runRecurring(s, now = today()) {
       const occ = occurrence(r, k);
       if (occ > now) break;
       if (r.last && occ <= r.last) continue;
-      s.tx.push({ id: uid(), date: occ, amount: r.amount, type: r.type, cat: r.cat, note: r.note, src: r.src === 'demo' ? 'demo' : 'recurring', rid: r.id, created: stamp + created });
-      r.last = occ; created++;
+      r.last = occ;
+      const id = `r_${r.id}_${occ}`;
+      if (!have) have = new Set(s.tx.map(t => t.id));
+      if (have.has(id) || (s.deleted && s.deleted.tx[id] !== undefined)) continue;   // already there, or deleted on purpose
+      s.tx.push({ id, date: occ, amount: r.amount, type: r.type, cat: r.cat, note: r.note, src: r.src === 'demo' ? 'demo' : 'recurring', rid: r.id, created: stamp + created });
+      have.add(id); created++;
     }
   }
   return created;
@@ -1274,10 +1485,11 @@ function buildDemo(now = today()) {
 const ui = {
   tab: 'overview',
   month: monthKey(today()),
-  f: { q: '', cat: '', type: '', scope: 'month', batch: '', needs: false, show: 200 },
+  f: { q: '', cat: '', type: '', acct: '', scope: 'month', batch: '', needs: false, show: 200 },
   drafts: { inline: null, modal: null },
   rulesQ: '', rulesAll: false,
-  hideNudge: false, hideProblem: false, hideInstall: false,
+  hideNudge: false, hideProblem: false, hideInstall: false, wantAdd: false,
+  pendingRestore: null,
   imp: null,
   _st: null, _months: null,
 };
@@ -1287,6 +1499,7 @@ const ACT = {}, CHANGE = {}, INPUT = {}, SUBMIT = {};
 
 function route() {
   const h = location.hash.replace('#', '');
+  if (h === 'add') ui.wantAdd = true;
   ui.tab = TABS.includes(h) ? h : 'overview';
 }
 
@@ -1400,6 +1613,7 @@ function applyTheme() {
 
 /* ---------- events ---------- */
 document.addEventListener('click', e => {
+  if (!state) return;
   const el = e.target.closest('[data-act]');
   if (!el || el.disabled) return;
   const fn = ACT[el.dataset.act];
@@ -1420,7 +1634,7 @@ document.addEventListener('submit', e => {
   if (SUBMIT[f.dataset.form]) SUBMIT[f.dataset.form](f, e);
 });
 document.addEventListener('keydown', e => {
-  if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (!state || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
   if (e.target.closest && e.target.closest('input, textarea, select, [contenteditable="true"], dialog')) return;
   if (document.querySelector('dialog[open]')) return;
   if (e.key === 'n' || e.key === 'N' || e.key === '+') { e.preventDefault(); openEntryModal(); }
@@ -1443,6 +1657,9 @@ ACT['add-entry'] = () => openEntryModal();
 /* ---------- toasts ---------- */
 function toast(msg, actions = []) {
   const root = $('#toasts');
+  // An open dialog blocks everything outside it, so messages move inside it to stay usable.
+  const dialogs = $$('dialog[open]'), host = dialogs[dialogs.length - 1] || document.body;
+  if (root.parentElement !== host) host.append(root);
   const el = document.createElement('div');
   el.className = 'toast';
   el.setAttribute('role', 'status');
@@ -1475,7 +1692,12 @@ function openModal({ title, body, foot = '', wide = false, onClose }) {
       ${foot ? `<div class="modal-foot">${foot}</div>` : ''}
     </div>`;
   document.body.append(dlg);
-  dlg.addEventListener('close', () => { dlg.remove(); if (onClose) onClose(dlg.returnValue); });
+  dlg.addEventListener('close', () => {
+    const t = dlg.querySelector('#toasts');
+    if (t) document.body.append(t);
+    dlg.remove();
+    if (onClose) onClose(dlg.returnValue);
+  });
   dlg.addEventListener('mousedown', e => { if (e.target === dlg) dlg.close('cancel'); });
   dlg.showModal();
   const first = dlg.querySelector('[autofocus]') || dlg.querySelector('.modal-body input:not([type="hidden"]):not([type="checkbox"]), .modal-body select');
@@ -1560,7 +1782,8 @@ function entryFormHTML(d, ctx) {
   const t = d.id ? state.tx.find(x => x.id === d.id) : null;
   let origin = '';
   if (t && t.rid) { const r = state.recurring.find(x => x.id === t.rid); origin = `Added by the recurring payment “${esc(r ? r.note || cat(r.cat).name : 'deleted')}”. Changes here affect only this entry.`; }
-  else if (t && t.batch) { const b = state.imports.find(x => x.id === t.batch); origin = `Imported from ${esc(b ? b.file : 'a statement')}.`; }
+  else if (t && t.batch) { const b = state.imports.find(x => x.id === t.batch); origin = `Imported from ${esc(b ? b.file : 'a statement')}${acctName(t) && t.acct ? `, ${esc(acctName(t))}` : ''}.`; }
+  if (t && t.bk && t.src !== 'import') origin += `${origin ? ' ' : ''}A bank statement row was matched to this entry, so it is counted once.`;
   return `<form class="entry" data-form="entry" data-ctx="${ctx}" autocomplete="off" novalidate>
     <div class="entry-top">
       <div class="seg" role="radiogroup" aria-label="Entry type">
@@ -1922,6 +2145,8 @@ function buildNotes(st) {
       out.push({ lvl: m.up ? 'warn' : 'good', html });
     }
   }
+  const rv = reviewCount();
+  if (rv) out.push({ lvl: 'warn', html: `${plural(rv, 'pair')} of entries may count the same money twice (a transfer between your accounts, or a payment entered twice). <button class="link" data-act="review-open">Check them</button>` });
   const uncat = st.txs.filter(t => t.cat === 'uncat').length;
   if (uncat) out.push({ lvl: 'info', html: `${plural(uncat, 'entry', 'entries')} this month ${uncat === 1 ? 'needs' : 'need'} a category. <button class="link" data-act="review-uncat">Sort them</button>` });
   const fixed = recurringMonthlySpend();
@@ -1995,6 +2220,7 @@ VIEWS.entries = {
     for (const t of all) { const c = cat(t.cat); spent += spendDelta(t.type, t.amount, c); income += incomeDelta(t.type, t.amount, c); }
     const scopeTx = f.scope === 'all' ? state.tx : state.tx.filter(t => monthKey(t.date) === ui.month);
     const needsCount = scopeTx.filter(t => t.cat === 'uncat').length;
+    const rvCount = reviewCount();
     const batch = f.batch ? state.imports.find(b => b.id === f.batch) : null;
 
     const toolbar = `<div class="toolbar" role="search">
@@ -2009,7 +2235,9 @@ VIEWS.entries = {
         <option value="expense"${f.type === 'expense' ? ' selected' : ''}>Money out</option>
         <option value="income"${f.type === 'income' ? ' selected' : ''}>Money in</option>
       </select>
+      ${state.accounts.length ? `<select data-change="f-acct" data-key="f-acct" aria-label="Account"><option value="">All accounts</option>${state.accounts.map(a => `<option value="${esc(a.id)}"${a.id === f.acct ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select>` : ''}
       ${needsCount || f.needs ? `<button type="button" class="toggle" aria-pressed="${f.needs}" data-act="f-needs" data-key="f-needs">Needs a category (${needsCount})</button>` : ''}
+      ${rvCount ? `<button type="button" class="toggle attn" data-act="review-open" data-key="f-review">Check double counting (${rvCount})</button>` : ''}
       ${batch ? `<span class="pill">From ${esc(batch.file)}<button class="icon-btn" data-act="f-batch-clear" aria-label="Show all entries, not just this import">×</button></span>` : ''}
     </div>`;
 
@@ -2021,7 +2249,7 @@ VIEWS.entries = {
 
     let body;
     if (!all.length) {
-      const filtered = f.q || f.cat || f.type || f.needs || f.batch;
+      const filtered = f.q || f.cat || f.type || f.needs || f.batch || f.acct;
       body = `<div class="ledger"><div class="empty-state"><p>${filtered ? 'Nothing matches these filters.' : `No entries in ${esc(fmtMonth(ui.month))}.`}</p>
         <div class="actions">${filtered ? '<button class="btn" data-act="f-clear">Clear filters</button>' : ''}${f.scope === 'month' ? '<button class="btn" data-act="f-scope" data-v="all">Show all time</button>' : ''}</div></div></div>`;
     } else {
@@ -2050,6 +2278,7 @@ function filteredTx() {
     else if (f.scope === 'month' && monthKey(t.date) !== ui.month) return false;
     if (f.needs && t.cat !== 'uncat') return false;
     if (f.cat && t.cat !== f.cat) return false;
+    if (f.acct && t.acct !== f.acct) return false;
     if (f.type && t.type !== f.type) return false;
     if (q && !norm(t.note + ' ' + cat(t.cat).name).includes(q)) return false;
     return true;
@@ -2064,9 +2293,11 @@ function txRowHTML(t) {
   else if (inc && c.kind === 'expense') sub = 'Refund';
   if (t.rid) sub = sub ? sub + ', recurring' : 'Recurring';
   else if (t.src === 'import') sub = sub ? sub + ', imported' : 'Imported';
+  const an = t.acct ? (state.accounts.find(a => a.id === t.acct) || {}).name : '';
+  if (an) sub = sub ? `${sub}, ${an}` : an;
   return `<div class="tx${counted ? '' : ' excluded'}">
     <span class="ico" aria-hidden="true">${esc(c.icon)}</span>
-    <button type="button" class="tx-main" data-act="edit-tx" data-id="${esc(t.id)}" aria-label="Edit ${esc(t.note || c.name)}, ${money(t.amount)}"><span class="tx-note${t.note ? '' : ' empty'}">${esc(t.note || c.name)}</span>${sub ? `<span class="tx-sub">${sub}</span>` : ''}</button>
+    <button type="button" class="tx-main" data-act="edit-tx" data-id="${esc(t.id)}" aria-label="Edit ${esc(t.note || c.name)}, ${money(t.amount)}"><span class="tx-note${t.note ? '' : ' empty'}">${esc(t.note || c.name)}</span>${sub ? `<span class="tx-sub">${esc(sub)}</span>` : ''}</button>
     <select class="tx-cat${t.cat === 'uncat' ? ' needs' : ''}" data-change="tx-cat" data-id="${esc(t.id)}" data-key="txcat-${esc(t.id)}" aria-label="Category">${catOptions(t.cat)}</select>
     <span class="tx-amt${inc ? ' in' : ''}">${money(inc ? t.amount : -t.amount, { sign: inc })}</span>
   </div>`;
@@ -2077,7 +2308,8 @@ ACT['f-scope'] = el => { ui.f.scope = el.dataset.v; ui.f.batch = ''; ui.f.show =
 ACT['f-needs'] = () => { ui.f.needs = !ui.f.needs; ui.f.show = 200; render(); };
 ACT['f-more'] = () => { ui.f.show += 200; render(); };
 ACT['f-batch-clear'] = () => { ui.f.batch = ''; render(); };
-ACT['f-clear'] = () => { Object.assign(ui.f, { q: '', cat: '', type: '', needs: false, batch: '', show: 200 }); render(); };
+ACT['f-clear'] = () => { Object.assign(ui.f, { q: '', cat: '', type: '', acct: '', needs: false, batch: '', show: 200 }); render(); };
+CHANGE['f-acct'] = el => { ui.f.acct = el.value; ui.f.show = 200; render(); };
 INPUT['f-q'] = el => { ui.f.q = el.value; ui.f.show = 200; render(); };
 CHANGE['f-cat'] = el => { ui.f.cat = el.value; ui.f.show = 200; render(); };
 CHANGE['f-type'] = el => { ui.f.type = el.value; ui.f.show = 200; render(); };
@@ -2557,7 +2789,8 @@ VIEWS.data = {
     const lb = s.lastBackup ? fmtDayAuto(s.lastBackup.slice(0, 10)) : null;
     const imports = state.imports.map(b => {
       const left = state.tx.filter(t => t.batch === b.id).length;
-      return `<tr><td class="desc">${esc(b.file)}</td><td>${b.at ? esc(fmtDayAuto(b.at.slice(0, 10))) : ''}</td><td class="num">${left}${left !== b.count ? ` <span class="muted">of ${b.count}</span>` : ''}</td><td class="num">${left ? `<button class="btn sm" data-act="f-batch" data-id="${esc(b.id)}">Show</button> <button class="btn sm danger" data-act="import-remove" data-id="${esc(b.id)}">Remove</button>` : ''}</td></tr>`;
+      const an = b.acct ? (state.accounts.find(a => a.id === b.acct) || {}).name : '';
+      return `<tr><td class="desc">${esc(b.file)}${an ? `<span class="tag">${esc(an)}</span>` : ''}</td><td>${b.at ? esc(fmtDayAuto(b.at.slice(0, 10))) : ''}</td><td class="num">${left}${left !== b.count ? ` <span class="muted">of ${b.count}</span>` : ''}</td><td class="num">${left ? `<button class="btn sm" data-act="f-batch" data-id="${esc(b.id)}">Show</button> <button class="btn sm danger" data-act="import-remove" data-id="${esc(b.id)}">Remove</button>` : ''}</td></tr>`;
     }).join('');
 
     const q = norm(ui.rulesQ);
@@ -2574,9 +2807,14 @@ VIEWS.data = {
     <div class="data-grid">
       <section class="panel">
         <h2>Backups</h2>
-        <p class="body">${HOSTED ? 'Phones can clear a page’s storage, for example when space runs low or browser data is cleared. Save a backup every week or so to your Files or a cloud folder. You can restore it here or in the computer version.' : 'If this browser’s data is cleared, your entries go with it. A backup is a small file you can keep in a cloud folder and restore here or on another computer.'}</p>
-        <p class="hint" style="margin-top:8px">${lb ? `Last backup: ${esc(lb)}.` : 'No backup yet.'} ${plural(state.tx.length, 'entry', 'entries')} stored.</p>
-        <div class="actions"><button class="btn primary" data-act="backup">${HOSTED ? 'Save a backup' : 'Download backup'}</button><button class="btn" data-act="restore">Restore from a backup</button>${HOSTED ? '<button class="btn ghost" data-act="restore-paste">Paste a backup</button>' : ''}</div>
+        <p class="body">${HOSTED ? 'Phones can clear a page’s storage, for example when space runs low or browser data is cleared. Save a backup every week or so and keep the file in a cloud folder. You can bring it in here or on your computer.' : 'If this browser’s data is cleared, your entries go with it. A backup is a small file you can keep in a cloud folder and restore here or on another computer.'}</p>
+        <p class="hint" style="margin-top:8px">${lb ? `Last backup: ${esc(lb)}.` : 'No backup yet.'} ${plural(state.tx.length, 'entry', 'entries')} stored.${s.changes && state.tx.length ? ` ${plural(s.changes, 'change')} since then.` : ''}</p>
+        <div class="actions"><button class="btn primary" data-act="backup">${HOSTED ? 'Save a backup' : 'Download backup'}</button><button class="btn" data-act="restore">Bring in a backup</button>${HOSTED && !WEB_APP ? '<button class="btn ghost" data-act="restore-paste">Paste a backup</button>' : ''}</div>
+        ${protectHTML()}
+        <details class="fold"><summary>Using it on a phone and a computer</summary>
+          <p class="body" style="margin-top:6px">Each device keeps its own entries. To combine them, save a backup on one device, send the file to the other (email, a cloud folder, a cable), and there choose <b>Bring in a backup</b>, then <b>Merge</b>. Nothing is lost on either side, and entries you deleted stay deleted. Do it in both directions to bring both devices fully up to date.</p>
+        </details>
+        ${snapshotsHTML()}
       </section>
 
       <section class="panel">
@@ -2584,6 +2822,7 @@ VIEWS.data = {
         <p class="body">Use the CSV or Excel export from your e-banking or Revolut. Greek bank formats (Χρέωση/Πίστωση columns, 12,50 amounts, Greek text) are understood. Rows you've already imported are skipped.</p>
         <div class="actions"><button class="btn primary" data-act="import-start">Choose a file</button></div>
         ${imports ? `<div class="tbl-wrap" style="margin-top:12px"><table class="tbl"><thead><tr><th>File</th><th>Imported</th><th class="num">Entries</th><th></th></tr></thead><tbody>${imports}</tbody></table></div>` : ''}
+        ${accountsHTML()}
       </section>
 
       <section class="panel span" id="rules">
@@ -2676,29 +2915,6 @@ $('#file-restore').addEventListener('change', async e => {
   e.target.value = '';
   if (f) restoreFromText(await f.text());
 });
-async function restoreFromText(text) {
-  let next;
-  try {
-    const raw = JSON.parse(text);
-    next = normalizeState(raw);
-    next.settings.lastBackup = typeof raw.exported === 'string' ? raw.exported : new Date().toISOString();
-    next.settings.changes = 0;
-  }
-  catch (err) { toast(err instanceof SyntaxError ? "That isn't a Spend Control backup." : err.message); return; }
-  const ok = await confirmModal({
-    title: 'Restore this backup?',
-    body: `Everything in the app now (${plural(state.tx.length, 'entry', 'entries')}) will be replaced by the backup's ${plural(next.tx.length, 'entry', 'entries')}.`,
-    ok: 'Replace with backup', danger: true,
-  });
-  if (!ok) return;
-  commit(s => {
-    for (const k of Object.keys(s)) delete s[k];
-    Object.assign(s, next);
-    runRecurring(s);
-  }, 'Backup restored.');
-  nfCache.clear(); applyTheme(); render();
-}
-
 /* ---------- export ---------- */
 ACT['export-csv'] = async () => {
   const comma = decimalSep() === ',';
@@ -2766,17 +2982,18 @@ ACT['demo-remove'] = () => {
 ACT['erase'] = async () => {
   const ok = await confirmModal({
     title: 'Erase everything?',
-    body: 'This deletes all entries, budgets, recurring payments, categories and rules from this browser. Download a backup first if you might want them back.',
+    body: 'This deletes all entries, budgets, recurring payments, categories and rules from this device. Save a backup first if you might want them back.',
     ok: 'Erase everything', danger: true,
   });
   if (!ok) return;
+  snapshotBefore('Before erasing everything');
   commit(s => {
     const keep = { currency: s.settings.currency, locale: s.settings.locale, theme: s.settings.theme };
     const fresh = freshState();
     for (const k of Object.keys(s)) delete s[k];
     Object.assign(s, fresh);
     Object.assign(s.settings, keep);
-  }, 'Everything was erased.');
+  }, 'Everything was erased.', [], { raw: true });
   ui.drafts.inline = null;
 };
 
@@ -2792,6 +3009,54 @@ ACT['import-remove'] = el => {
     s.tx = s.tx.filter(t => t.batch !== id);
     s.imports = s.imports.filter(x => x.id !== id);
   }, `Removed ${plural(n, 'entry', 'entries')} imported from ${b ? b.file : 'that file'}.`);
+};
+
+/* ---------- storage protection, earlier versions, accounts ---------- */
+function protectHTML() {
+  if (!(WEB_APP && HOSTED) || inClaude() || store.persisted == null) return '';
+  return store.persisted
+    ? '<p class="hint" style="margin-top:10px">Storage is protected: this browser has agreed not to clear your entries on its own. Backups still matter if the phone is lost or reset.</p>'
+    : '<p class="hint" style="margin-top:10px">Storage is not protected yet: the browser may clear entries if the device runs low on space. Installing the app to your home screen usually fixes this. <button class="link" data-act="persist-ask">Ask the browser again</button></p>';
+}
+ACT['persist-ask'] = async () => {
+  const ok = await askPersist(true);
+  render();
+  toast(ok ? 'Done. The browser will keep your entries.' : "The browser didn't agree yet. Install the app to your home screen and keep making backups.");
+};
+function snapshotsHTML() {
+  if (!store.db) return '';
+  const list = snapshotList();
+  if (!list.length) return '';
+  const rows = list.map(x => `<tr><td>${esc(snapshotLabel(x))}</td><td class="num">${plural(x.n, 'entry', 'entries')}</td><td class="num"><button class="btn sm" data-act="snap-restore" data-key="${esc(x.key)}">Go back to this</button></td></tr>`).join('');
+  return `<details class="fold"><summary>Earlier versions (${list.length})</summary>
+    <p class="hint" style="margin:6px 0">How things stood on each of the last 14 days you made changes, and just before big changes. They live on this device, so they help with mistakes but are no substitute for a backup file.</p>
+    <div class="tbl-wrap"><table class="tbl"><tbody>${rows}</tbody></table></div></details>`;
+}
+function accountsHTML() {
+  if (!state.accounts.length) return '';
+  const rows = state.accounts.map(a => {
+    const n = state.tx.filter(t => t.acct === a.id).length;
+    return `<tr><td><input type="text" class="name-in" value="${esc(a.name)}" maxlength="40" data-change="acct-name" data-id="${esc(a.id)}" data-key="acct-${esc(a.id)}" aria-label="Account name"></td><td class="num">${plural(n, 'entry', 'entries')}</td><td class="num"><button type="button" class="icon-btn" data-act="acct-delete" data-id="${esc(a.id)}" aria-label="Remove the account ${esc(a.name)}" title="Remove">×</button></td></tr>`;
+  }).join('');
+  return `<h3 class="sub-h">Your accounts</h3>
+    <p class="hint">Statements are filed under an account, which is how transfers between your own accounts are spotted.</p>
+    <div class="tbl-wrap"><table class="tbl budget-tbl"><tbody>${rows}</tbody></table></div>`;
+}
+CHANGE['acct-name'] = el => {
+  const id = el.dataset.id, name = el.value.trim().slice(0, 40), a = state.accounts.find(x => x.id === id);
+  if (!a || !name) { render(); return; }
+  if (name === a.name) return;
+  if (state.accounts.some(x => x.id !== id && norm(x.name) === norm(name))) { toast(`There's already an account called ${name}.`); render(); return; }
+  setTimeout(() => commit(s => { const x = s.accounts.find(y => y.id === id); if (x) x.name = name; }), 0);
+};
+ACT['acct-delete'] = el => {
+  const id = el.dataset.id, a = state.accounts.find(x => x.id === id);
+  if (!a) return;
+  commit(s => {
+    s.accounts = s.accounts.filter(x => x.id !== id);
+    for (const t of s.tx) if (t.acct === id) delete t.acct;
+    for (const b of s.imports) if (b.acct === id) delete b.acct;
+  }, `Removed the account ${a.name}. Its entries are kept.`);
 };
 
 /* =========================================================================
@@ -3098,11 +3363,22 @@ function guessColumns(header, data) {
   return { date, desc, amount, debit, credit, dc, stateCol, mode };
 }
 
+const HEAD_CUR = ['currency', 'νομισμα', 'ccy', 'währung', 'devise', 'divisa'];
+const HEAD_FEE = ['fee', 'fees', 'προμηθεια', 'commission', 'εξοδα'];
+function findCol(header, words) {
+  let best = -1, bs = 1;
+  header.forEach((h, i) => { const sc = headScore(h, words); if (sc > bs) { bs = sc; best = i; } });
+  return best;
+}
 function importConfig(rows, headerRow) {
   const header = headerRow >= 0 ? rows[headerRow] || [] : [];
   const data = rows.slice(headerRow + 1).filter(r => r && r.some(c => c !== '' && c != null));
   const g = guessColumns(header, data);
-  const cfg = { headerRow, dateCol: g.date, descCol: g.desc, amountCol: g.amount, debitCol: g.debit, creditCol: g.credit, dcCol: g.dc, stateCol: g.stateCol, mode: g.mode, dateFmt: 'dmy', dec: '.', sign: 'negout', includeIncome: true };
+  const cfg = {
+    headerRow, dateCol: g.date, descCol: g.desc, amountCol: g.amount, debitCol: g.debit, creditCol: g.credit, dcCol: g.dc, stateCol: g.stateCol,
+    curCol: findCol(header, HEAD_CUR), feeCol: findCol(header, HEAD_FEE),
+    mode: g.mode, dateFmt: 'dmy', dec: '.', sign: 'negout', includeIncome: true, skipMatched: true, rates: {}, acct: '', acctName: '',
+  };
   if (cfg.mode === 'split' && cfg.amountCol >= 0 && cfg.debitCol < 0 && cfg.creditCol < 0) cfg.mode = 'signed';
   cfg.dateFmt = cfg.dateCol >= 0 ? detectDateFormat(data.map(r => r[cfg.dateCol])) : 'dmy';
   const amountCols = cfg.mode === 'split' ? [cfg.debitCol, cfg.creditCol] : [cfg.amountCol];
@@ -3112,19 +3388,41 @@ function importConfig(rows, headerRow) {
   }
   return cfg;
 }
+/* A fingerprint of the file's layout, used to recognise the same bank next time. */
+function importSig(rows, cfg) {
+  if (cfg.headerRow < 0) return '';
+  return (rows[cfg.headerRow] || []).map(c => norm(c)).filter(Boolean).join('|').slice(0, 400);
+}
+const KNOWN_BANKS = [['revolut', 'Revolut'], ['piraeus', 'Piraeus'], ['πειραι', 'Piraeus'], ['winbank', 'Piraeus'], ['nbg', 'NBG'], ['εθνικ', 'NBG'], ['ethniki', 'NBG'],
+  ['alpha', 'Alpha Bank'], ['eurobank', 'Eurobank'], ['viva', 'Viva'], ['n26', 'N26'], ['wise', 'Wise'], ['paypal', 'PayPal'], ['optima', 'Optima'], ['attica', 'Attica Bank']];
+function guessAccount(imp) {
+  const cfg = imp.cfg, sig = importSig(imp.rows, cfg);
+  const known = sig && state.accounts.find(a => (a.sigs || []).includes(sig));
+  if (known) { cfg.acct = known.id; cfg.acctName = ''; return; }
+  const text = norm(imp.file) + ' ' + sig;
+  let name = (KNOWN_BANKS.find(([k]) => text.includes(k)) || [])[1];
+  if (!name && sig.includes('started date') && sig.includes('completed date')) name = 'Revolut';
+  const same = name && state.accounts.find(a => norm(a.name) === norm(name));
+  if (same) { cfg.acct = same.id; cfg.acctName = ''; return; }
+  cfg.acct = '__new';
+  cfg.acctName = name || (state.accounts.length ? `Account ${state.accounts.length + 1}` : 'My bank');
+}
 
 const cleanDesc = v => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
 const dupKey = t => `${t.date}|${t.type}|${t.amount}|${norm(t.note)}`;
 
 function buildImport(rows, cfg) {
   const items = [];
-  const skipped = { noDate: 0, noAmount: 0, reverted: 0, income: 0 };
+  const skipped = { noDate: 0, noAmount: 0, reverted: 0, pending: 0, income: 0, foreign: {} };
+  const home = state.settings.currency, codes = new Set();
   for (let i = cfg.headerRow + 1; i < rows.length; i++) {
     const r = rows[i];
     if (!r || !r.some(c => c !== '' && c != null)) continue;
     const date = cfg.dateCol >= 0 ? parseDateWith(r[cfg.dateCol], cfg.dateFmt) : null;
     if (!date) { skipped.noDate++; continue; }
-    if (cfg.stateCol >= 0 && /revert|declin|fail|cancel|ακυρ|απορρ/i.test(String(r[cfg.stateCol] ?? ''))) { skipped.reverted++; continue; }
+    const st = cfg.stateCol >= 0 ? String(r[cfg.stateCol] ?? '') : '';
+    if (st && /revert|declin|fail|cancel|ακυρ|απορρ/i.test(st)) { skipped.reverted++; continue; }
+    if (st && /pending|εκκρεμ/i.test(st)) { skipped.pending++; continue; }
     let v = NaN, type = 'expense';
     if (cfg.mode === 'split') {
       const dv = cfg.debitCol >= 0 ? parseAmount(r[cfg.debitCol], cfg.dec) : NaN;
@@ -3134,20 +3432,62 @@ function buildImport(rows, cfg) {
     } else if (cfg.mode === 'dc') {
       const a = cfg.amountCol >= 0 ? parseAmount(r[cfg.amountCol], cfg.dec) : NaN;
       const ind = norm(cfg.dcCol >= 0 ? r[cfg.dcCol] : '');
-      if (Number.isFinite(a) && a !== 0) { v = Math.abs(a); type = DC_IN.has(ind) ? 'income' : DC_OUT.has(ind) ? 'expense' : (a < 0 ? 'expense' : 'expense'); }
+      if (Number.isFinite(a) && a !== 0) { v = Math.abs(a); type = DC_IN.has(ind) ? 'income' : 'expense'; }
     } else {
       const a = cfg.amountCol >= 0 ? parseAmount(r[cfg.amountCol], cfg.dec) : NaN;
       if (Number.isFinite(a) && a !== 0) { v = Math.abs(a); type = (cfg.sign === 'negout' ? a < 0 : a > 0) ? 'expense' : 'income'; }
     }
     if (!Number.isFinite(v) || v === 0) { skipped.noAmount++; continue; }
+    // A separate fee column (Revolut) is part of what the payment cost.
+    const fee = cfg.feeCol >= 0 ? Math.abs(parseAmount(r[cfg.feeCol], cfg.dec)) : 0;
+    if (fee > 0) v = type === 'expense' ? v + fee : Math.max(0, v - fee);
     if (type === 'income' && !cfg.includeIncome) { skipped.income++; continue; }
-    const note = cleanDesc(cfg.descCol >= 0 ? r[cfg.descCol] : '');
-    items.push({ date, amount: Math.round(v * 100), type, note, cat: ruleCat(note, type) || 'uncat' });
+    let note = cleanDesc(cfg.descCol >= 0 ? r[cfg.descCol] : '');
+    // Rows in another currency need a rate, or they are left out.
+    const cur = cfg.curCol >= 0 ? String(r[cfg.curCol] ?? '').trim().toUpperCase() : '';
+    if (/^[A-Z]{3}$/.test(cur) && cur !== home) {
+      codes.add(cur);
+      const rate = parseAmount(cfg.rates[cur] ?? '');
+      if (!(rate > 0)) { skipped.foreign[cur] = (skipped.foreign[cur] || 0) + 1; continue; }
+      note = `${note} (${v.toFixed(2)} ${cur})`.trim().slice(0, 200);
+      v *= rate;
+    }
+    const amount = Math.round(v * 100);
+    if (amount <= 0) { skipped.noAmount++; continue; }
+    const it = { date, amount, type, note, cat: ruleCat(note, type) || 'uncat' };
+    it.key = dupKey(it);
+    items.push(it);
   }
+  // 1. Rows imported before (or already tied to an entry you added) are repeats.
   const have = new Map();
-  for (const t of state.tx) { const k = dupKey(t); have.set(k, (have.get(k) || 0) + 1); }
-  for (const t of items) { const k = dupKey(t), n = have.get(k) || 0; if (n > 0) { t.dup = true; have.set(k, n - 1); } }
-  return { items, skipped };
+  for (const t of state.tx) { const k = t.bk || (t.src === 'import' ? dupKey(t) : null); if (k) have.set(k, (have.get(k) || 0) + 1); }
+  for (const it of items) { const n = have.get(it.key) || 0; if (n > 0) { it.dup = true; have.set(it.key, n - 1); } }
+  // 2. Rows that are the bank's side of something you typed or of a recurring payment:
+  //    same amount, and the bank's date up to 3 days before or 7 days after yours.
+  const mine = new Map();
+  for (const t of state.tx) {
+    if (t.src === 'import' || t.src === 'demo' || t.bk) continue;
+    const k = `${t.type}|${t.amount}`;
+    if (!mine.has(k)) mine.set(k, []);
+    mine.get(k).push(t);
+  }
+  const pairs = [];
+  items.forEach((it, idx) => {
+    if (it.dup) return;
+    for (const t of mine.get(`${it.type}|${it.amount}`) || []) {
+      const d = daysBetween(t.date, it.date);
+      if (d < (t.rid ? -7 : -3) || d > 7) continue;
+      pairs.push({ idx, id: t.id, score: d >= 0 ? d : 0.5 - d });
+    }
+  });
+  pairs.sort((x, y) => x.score - y.score);
+  const usedRow = new Set(), usedTx = new Set();
+  for (const p of pairs) {
+    if (usedRow.has(p.idx) || usedTx.has(p.id)) continue;
+    usedRow.add(p.idx); usedTx.add(p.id);
+    items[p.idx].match = p.id;
+  }
+  return { items, skipped, codes: [...codes].sort() };
 }
 
 /* ---------- the import dialog ---------- */
@@ -3170,6 +3510,7 @@ async function startImport(file) {
     else decodeImportText(imp);
     if (!imp.rows.some(r => r && r.filter(c => c !== '' && c != null).length >= 2)) throw new Error("Couldn't find any rows of data in that file.");
     imp.cfg = importConfig(imp.rows, detectHeaderRow(imp.rows));
+    guessAccount(imp);
     ui.imp = imp;
     openImportModal();
   } catch (err) {
@@ -3201,9 +3542,18 @@ function refreshImportModal() {
   body.scrollTop = scroll;
   dlg.querySelector('.modal-foot').innerHTML = importFootHTML();
 }
+/* What will actually be added, and which rows only confirm entries you already have. */
+function importPlan() {
+  const imp = ui.imp, res = imp.res, skip = imp.cfg.skipMatched;
+  const matched = res.items.filter(t => !t.dup && t.match);
+  const fresh = res.items.filter(t => !t.dup && !(t.match && skip));
+  return { fresh, matched, confirm: skip ? matched : [] };
+}
 function importFootHTML() {
-  const n = ui.imp.res ? ui.imp.res.items.filter(t => !t.dup).length : 0;
-  return `<button type="button" class="btn" data-act="modal-close">Cancel</button><button type="button" class="btn primary" data-act="imp-commit"${n ? '' : ' disabled'}>Import ${plural(n, 'entry', 'entries')}</button>`;
+  if (!ui.imp.res) return '';
+  const { fresh, confirm } = importPlan();
+  const label = fresh.length ? `Import ${plural(fresh.length, 'entry', 'entries')}` : confirm.length ? 'Done' : 'Import 0 entries';
+  return `<button type="button" class="btn" data-act="modal-close">Cancel</button><button type="button" class="btn primary" data-act="imp-commit"${fresh.length || confirm.length ? '' : ' disabled'}>${label}</button>`;
 }
 function importBodyHTML() {
   const imp = ui.imp, cfg = imp.cfg, rows = imp.rows;
@@ -3218,7 +3568,7 @@ function importBodyHTML() {
   };
   const colOpts = (sel, none) => `${none ? `<option value="-1"${sel < 0 ? ' selected' : ''}>${none}</option>` : (sel < 0 ? '<option value="-1" selected>Choose a column</option>' : '')}${Array.from({ length: ncol }, (_, i) => `<option value="${i}"${i === sel ? ' selected' : ''}>${esc(colName(i))}</option>`).join('')}`;
   const sel = (name, opts, extra = '') => `<select name="${name}" data-change="imp"${extra}>${opts}</select>`;
-  const opt = (v, label, cur) => `<option value="${v}"${String(v) === String(cur) ? ' selected' : ''}>${label}</option>`;
+  const opt = (v, label, cur) => `<option value="${esc(v)}"${String(v) === String(cur) ? ' selected' : ''}>${label}</option>`;
   const delimName = { ';': 'semicolons', ',': 'commas', '\t': 'tabs', '|': 'vertical bars' }[imp.delim] || 'commas';
   const dataRows = rows.slice(cfg.headerRow + 1).filter(r => r && r.some(c => c !== '' && c != null)).length;
 
@@ -3231,9 +3581,14 @@ function importBodyHTML() {
     amountFields = `<label>Amount column${sel('amountCol', colOpts(cfg.amountCol))}</label><label>Money out is shown as${sel('sign', opt('negout', 'Negative amounts (−12,50)', cfg.sign) + opt('posout', 'Positive amounts', cfg.sign))}</label>`;
   }
 
-  const fresh = res.items.filter(t => !t.dup);
+  const acctField = `<label>Which account is this?${sel('acct', state.accounts.map(a => opt(a.id, esc(a.name), cfg.acct)).join('') + opt('__new', 'A new account…', cfg.acct) + opt('', 'Not saying', cfg.acct))}</label>`
+    + (cfg.acct === '__new' ? `<label>Name for the account<input type="text" name="acctName" data-change="imp" maxlength="40" value="${esc(cfg.acctName)}" placeholder="Piraeus, Revolut…"></label>` : '');
+  const home = state.settings.currency;
+  const rateFields = res.codes.map(c => `<label>1 ${esc(c)} in ${esc(home)}<input type="text" name="rate:${esc(c)}" data-change="imp" inputmode="decimal" value="${esc(cfg.rates[c] ?? '')}" placeholder="Empty leaves ${esc(c)} rows out"></label>`).join('');
+
+  const { fresh, matched } = importPlan();
   const out = fresh.filter(t => t.type === 'expense'), inn = fresh.filter(t => t.type === 'income');
-  const dups = res.items.length - fresh.length;
+  const dups = res.items.filter(t => t.dup).length;
   const needCat = fresh.filter(t => t.cat === 'uncat').length;
   const skippedN = res.skipped.noDate + res.skipped.noAmount;
   const dateRange = fresh.length ? (() => { const ds = fresh.map(t => t.date).sort(); return `${fmtDayYear(ds[0])} to ${fmtDayYear(ds[ds.length - 1])}`; })() : '';
@@ -3241,16 +3596,46 @@ function importBodyHTML() {
     ? `<b>${plural(fresh.length, 'new entry', 'new entries')}</b>${dateRange ? `, ${dateRange}` : ''}: ${out.length} out (${money(sumBy(out, t => t.amount))}), ${inn.length} in (${money(sumBy(inn, t => t.amount))}).`
       + (needCat ? ` ${needCat} will need a category.` : ' All of them get a category from your rules.')
     : '<b>Nothing new to import.</b>';
-  const extras = [dups && `${plural(dups, 'row')} already imported`, skippedN && `${plural(skippedN, 'row')} without a readable date or amount`, res.skipped.reverted && `${plural(res.skipped.reverted, 'reverted or declined payment')}`, res.skipped.income && `${plural(res.skipped.income, 'money-in row')} left out`].filter(Boolean);
+  const foreign = Object.entries(res.skipped.foreign).map(([c, n]) => `${plural(n, 'row')} in ${esc(c)} (enter a rate above to include them)`);
+  const extras = [dups && `${plural(dups, 'row')} already imported`,
+    cfg.skipMatched && matched.length && `${plural(matched.length, 'row')} you already entered yourself`,
+    skippedN && `${plural(skippedN, 'row')} without a readable date or amount`,
+    res.skipped.reverted && `${plural(res.skipped.reverted, 'reverted or declined payment')}`,
+    res.skipped.pending && `${plural(res.skipped.pending, 'pending payment')} (import again once completed)`,
+    res.skipped.income && `${plural(res.skipped.income, 'money-in row')} left out`, ...foreign].filter(Boolean);
 
+  const tag = t => (t.dup ? '<span class="tag">already imported</span>' : t.match && cfg.skipMatched ? '<span class="tag">you entered this</span>' : '');
   const preview = res.items.slice(0, 12).map(t => {
-    const c = cat(t.cat), inc = t.type === 'income';
-    return `<tr class="${t.dup ? 'dup' : ''}"><td>${esc(fmtDayYear(t.date))}</td><td class="desc" title="${esc(t.note)}">${esc(t.note) || '<span class="muted">No description</span>'}${t.dup ? '<span class="tag">already imported</span>' : ''}</td><td><span class="cell-name"><span class="ico" aria-hidden="true">${esc(c.icon)}</span>${esc(c.name)}</span></td><td class="num${inc ? ' t-good' : ''}">${money(inc ? t.amount : -t.amount, { sign: inc })}</td></tr>`;
+    const c = cat(t.cat), inc = t.type === 'income', off = t.dup || (t.match && cfg.skipMatched);
+    return `<tr class="${off ? 'dup' : ''}"><td>${esc(fmtDayYear(t.date))}</td><td class="desc" title="${esc(t.note)}">${esc(t.note) || '<span class="muted">No description</span>'}${tag(t)}</td><td><span class="cell-name"><span class="ico" aria-hidden="true">${esc(c.icon)}</span>${esc(c.name)}</span></td><td class="num${inc ? ' t-good' : ''}">${money(inc ? t.amount : -t.amount, { sign: inc })}</td></tr>`;
   }).join('');
 
+  let matchBlock = '';
+  if (matched.length) {
+    const byId = new Map(state.tx.map(t => [t.id, t]));
+    const rowsHtml = matched.slice(0, 20).map(t => {
+      const m = byId.get(t.match), inc = t.type === 'income';
+      return `<tr><td>${esc(fmtDM(t.date))}</td><td class="desc" title="${esc(t.note)}">${esc(t.note)}</td><td class="num">${money(inc ? t.amount : -t.amount, { sign: inc })}</td><td>${m ? `${esc(m.note || cat(m.cat).name)}, ${esc(fmtDM(m.date))}${m.rid ? ' (recurring)' : ''}` : ''}</td></tr>`;
+    }).join('');
+    matchBlock = `<div class="imp-match">
+      <label class="check"><input type="checkbox" name="skipMatched" data-change="imp"${cfg.skipMatched ? ' checked' : ''}> Leave out ${plural(matched.length, 'row')} that ${matched.length === 1 ? 'matches an entry' : 'match entries'} you typed or a recurring payment, so nothing is counted twice</label>
+      <details class="fold"><summary>See what matched</summary><div class="tbl-wrap"><table class="tbl imp-preview"><thead><tr><th>Bank date</th><th>Bank description</th><th class="num">Amount</th><th>Your entry</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>${matched.length > 20 ? `<p class="hint">Showing 20 of ${matched.length}.</p>` : ''}</details>
+    </div>`;
+  }
+
+  // Column settings stay folded away when the file was read without trouble.
+  const showCols = imp.showCols ?? res.items.length === 0;
   return `<div class="imp">
-    <p class="imp-file"><b>${esc(imp.file)}</b>: ${plural(dataRows, 'row')}${imp.kind === 'text' ? `, separated by ${delimName}` : imp.kind === 'xlsx' ? ' in the first sheet' : ''}. Check the columns below, then import.</p>
-    <div class="imp-grid">
+    <p class="imp-file"><b>${esc(imp.file)}</b>: ${plural(dataRows, 'row')}${imp.kind === 'text' ? `, separated by ${delimName}` : imp.kind === 'xlsx' ? ' in the first sheet' : ''}.</p>
+    <div class="imp-grid imp-top">
+      ${acctField}
+      ${rateFields}
+    </div>
+    <div class="imp-summary">${summary}${extras.length ? `<br><span class="muted">Left out: ${extras.join(', ')}.</span>` : ''}</div>
+    ${matchBlock}
+    ${preview ? `<div class="tbl-wrap"><table class="tbl imp-preview"><thead><tr><th>Date</th><th>Description</th><th>Category</th><th class="num">Amount</th></tr></thead><tbody>${preview}</tbody></table></div>${res.items.length > 12 ? `<p class="hint" style="margin-top:6px">Showing the first 12 of ${plural(res.items.length, 'row')}.</p>` : ''}` : '<p class="muted">No rows could be read with these settings. Try another header row or different columns below.</p>'}
+    <details class="fold imp-cols"${showCols ? ' open' : ''} data-toggle="imp-cols"><summary>Dates or amounts look wrong? Change how the file is read</summary>
+    <div class="imp-grid" style="margin-top:10px">
       <label>Header row${sel('headerRow', opt(-1, 'No header row', cfg.headerRow) + rows.slice(0, 30).map((r, i) => opt(i, `Row ${i + 1}: ${esc((r || []).filter(c => c !== '').slice(0, 3).join(', ').slice(0, 40))}`, cfg.headerRow)).join(''))}</label>
       <label>Date column${sel('dateCol', colOpts(cfg.dateCol))}</label>
       <label>Date format${sel('dateFmt', opt('dmy', 'Day/month/year (31/12/2026)', cfg.dateFmt) + opt('mdy', 'Month/day/year (12/31/2026)', cfg.dateFmt) + opt('ymd', 'Year-month-day (2026-12-31)', cfg.dateFmt) + opt('excel', 'Excel date number', cfg.dateFmt) + opt('text', 'Written out (31 Dec 2026)', cfg.dateFmt))}</label>
@@ -3260,23 +3645,31 @@ function importBodyHTML() {
       <label>Decimal mark${sel('dec', opt(',', 'Comma (12,50)', cfg.dec) + opt('.', 'Point (12.50)', cfg.dec))}</label>
       ${imp.kind === 'text' ? `<label>Text encoding${sel('enc', opt('auto', `Automatic${imp.encUsed ? ` (${imp.encUsed === 'windows-1253' ? 'Greek Windows-1253' : imp.encUsed.toUpperCase()})` : ''}`, imp.enc) + opt('utf-8', 'UTF-8', imp.enc) + opt('windows-1253', 'Greek (Windows-1253)', imp.enc) + opt('iso-8859-7', 'Greek (ISO-8859-7)', imp.enc) + opt('windows-1252', 'Western (Windows-1252)', imp.enc))}</label>` : ''}
       <label class="check"><input type="checkbox" name="includeIncome" data-change="imp"${cfg.includeIncome ? ' checked' : ''}> Include money in (salary, refunds)</label>
-    </div>
-    <div class="imp-summary">${summary}${extras.length ? `<br><span class="muted">Skipped: ${extras.join(', ')}.</span>` : ''}</div>
-    ${preview ? `<div class="tbl-wrap"><table class="tbl imp-preview"><thead><tr><th>Date</th><th>Description</th><th>Category</th><th class="num">Amount</th></tr></thead><tbody>${preview}</tbody></table></div>${res.items.length > 12 ? `<p class="hint" style="margin-top:6px">Showing the first 12 of ${plural(res.items.length, 'row')}.</p>` : ''}` : '<p class="muted">No rows could be read with these settings. Try another header row or different columns.</p>'}
+    </div></details>
   </div>`;
 }
+/* Remember whether the column settings are open while the dialog redraws. */
+document.addEventListener('toggle', e => {
+  const d = e.target;
+  if (d && d.dataset && d.dataset.toggle === 'imp-cols' && ui.imp) ui.imp.showCols = d.open;
+}, true);
 
 CHANGE['imp'] = el => {
   const imp = ui.imp;
-  if (!imp) return;
+  if (!imp || imp.busy) return;
+  imp.busy = true;
+  try { importChanged(el, imp); } finally { imp.busy = false; }
+};
+function importChanged(el, imp) {
   const cfg = imp.cfg, name = el.name;
+  const keep = () => ({ includeIncome: cfg.includeIncome, skipMatched: cfg.skipMatched, acct: cfg.acct, acctName: cfg.acctName });
   if (name === 'enc') {
     imp.enc = el.value;
+    const k = keep();
     decodeImportText(imp);
-    imp.cfg = importConfig(imp.rows, detectHeaderRow(imp.rows));
+    imp.cfg = Object.assign(importConfig(imp.rows, detectHeaderRow(imp.rows)), k);
   } else if (name === 'headerRow') {
-    const keep = { includeIncome: cfg.includeIncome };
-    imp.cfg = Object.assign(importConfig(imp.rows, +el.value), keep);
+    imp.cfg = Object.assign(importConfig(imp.rows, +el.value), keep());
   } else if (name === 'mode') {
     cfg.mode = el.value;
     const data = imp.rows.slice(cfg.headerRow + 1);
@@ -3284,31 +3677,58 @@ CHANGE['imp'] = el => {
       if (cfg.amountCol < 0) cfg.amountCol = cfg.debitCol >= 0 ? cfg.debitCol : cfg.creditCol;
       if (cfg.mode === 'signed' && cfg.amountCol >= 0) cfg.sign = data.some(r => r && parseAmount(r[cfg.amountCol], cfg.dec) < 0) ? 'negout' : 'posout';
     }
-  } else if (name === 'includeIncome') cfg.includeIncome = el.checked;
+  } else if (name === 'includeIncome' || name === 'skipMatched') cfg[name] = el.checked;
+  else if (name === 'acct') { cfg.acct = el.value; if (cfg.acct === '__new' && !cfg.acctName) cfg.acctName = state.accounts.length ? `Account ${state.accounts.length + 1}` : 'My bank'; }
+  else if (name === 'acctName') cfg.acctName = el.value.slice(0, 40);
+  else if (name.startsWith('rate:')) cfg.rates[name.slice(5)] = el.value.trim();
   else if (['dateFmt', 'dec', 'sign'].includes(name)) cfg[name] = el.value;
   else {
     cfg[name] = +el.value;
     if (name === 'dateCol' && cfg.dateCol >= 0) cfg.dateFmt = detectDateFormat(imp.rows.slice(cfg.headerRow + 1).map(r => r && r[cfg.dateCol]));
   }
   refreshImportModal();
-  const again = $(`dialog.modal[open] [name="${name}"]`);
+  const again = $(`dialog.modal[open] [name="${CSS.escape(name)}"]`);
   if (again) again.focus();
-};
+}
 
 ACT['imp-commit'] = el => {
   const imp = ui.imp;
   if (!imp || !imp.res) return;
-  const items = imp.res.items.filter(t => !t.dup);
-  if (!items.length) return;
-  const batchId = uid(), file = imp.file, stamp = Date.now();
-  const needCat = items.filter(t => t.cat === 'uncat').length;
+  const cfg = imp.cfg;
+  const { fresh, confirm } = importPlan();
+  if (!fresh.length && !confirm.length) return;
+  const batchId = uid(), file = imp.file, stamp = Date.now(), sig = importSig(imp.rows, cfg);
+  const needCat = fresh.filter(t => t.cat === 'uncat').length;
+  const newName = cfg.acct === '__new' ? cfg.acctName.trim().slice(0, 40) : '';
   el.closest('dialog')?.close('ok');
-  Object.assign(ui.f, { batch: batchId, scope: 'all', needs: false, q: '', cat: '', type: '', show: 200 });
+  if (fresh.length) Object.assign(ui.f, { batch: batchId, scope: 'all', needs: false, q: '', cat: '', type: '', acct: '', show: 200 });
+  const parts = [];
+  if (fresh.length) parts.push(`Imported ${plural(fresh.length, 'entry', 'entries')}`);
+  if (confirm.length) parts.push(`${fresh.length ? 'left out ' : 'Left out '}${plural(confirm.length, 'row')} you had already entered`);
   commit(s => {
-    s.imports.unshift({ id: batchId, file, at: new Date().toISOString(), count: items.length });
-    items.forEach((t, i) => s.tx.push({ id: uid(), date: t.date, amount: t.amount, type: t.type, cat: t.cat, note: t.note, src: 'import', batch: batchId, created: stamp + i }));
-  }, `Imported ${plural(items.length, 'entry', 'entries')}${needCat ? `. ${needCat} need a category` : ''}.`);
-  if (location.hash !== '#entries') location.hash = '#entries'; else render();
+    let acctId = '';
+    if (newName) {
+      const same = s.accounts.find(a => norm(a.name) === norm(newName));
+      if (same) acctId = same.id; else { acctId = 'a_' + uid(); s.accounts.push({ id: acctId, name: newName, sigs: [] }); }
+    } else if (cfg.acct && cfg.acct !== '__new' && s.accounts.some(a => a.id === cfg.acct)) acctId = cfg.acct;
+    const acct = s.accounts.find(a => a.id === acctId);
+    if (acct && sig && !(acct.sigs || []).includes(sig)) acct.sigs = [...(acct.sigs || []), sig].slice(-12);
+    if (fresh.length) {
+      const b = { id: batchId, file, at: new Date().toISOString(), count: fresh.length };
+      if (acctId) b.acct = acctId;
+      s.imports.unshift(b);
+    }
+    fresh.forEach((t, i) => {
+      const e = { id: uid(), date: t.date, amount: t.amount, type: t.type, cat: t.cat, note: t.note, src: 'import', batch: batchId, bk: t.key, created: stamp + i };
+      if (acctId) e.acct = acctId;
+      s.tx.push(e);
+    });
+    // Entries you typed that the statement confirms: remember the bank row so it is never imported later.
+    const byId = new Map(s.tx.map(t => [t.id, t]));
+    for (const t of confirm) { const m = byId.get(t.match); if (m) { m.bk = t.key; if (acctId && !m.acct) m.acct = acctId; } }
+  }, `${parts.join(', ')}${needCat ? `. ${needCat} need a category` : ''}.`);
+  if (fresh.length) { if (location.hash !== '#entries') location.hash = '#entries'; else render(); }
+  offerReview();
 };
 
 /* =========================================================================
@@ -3527,34 +3947,490 @@ window.addEventListener('resize', debounce(() => {
 }, 120));
 
 /* =========================================================================
+   Merging two copies of the data (phone and computer), and going back to an
+   earlier day.
+
+   Rules: records are matched by id. When both sides have one, the side that
+   changed it last wins. A deletion beats an older edit; a newer edit beats a
+   deletion. Entries that exist on one side only are added, unless the other
+   side already has an identical entry (same date, direction, amount and
+   description), which happens when both devices imported the same statement.
+   ========================================================================= */
+function mergeStates(localState, incomingState) {
+  const A = JSON.parse(JSON.stringify(localState)), B = JSON.parse(JSON.stringify(incomingState));
+  const stats = { added: 0, updated: 0, removed: 0, same: 0 };
+  const delA = A.deleted, delB = B.deleted;
+  const gone = (bucket, key, x) => bucket[key] !== undefined && bucket[key] >= stampOf(x);
+  // When the same thing was set up separately on both devices, both settle on the smaller id,
+  // so later edits and deletions line up.
+  const moveKey = (obj, from, to) => { if (obj[from] !== undefined) { obj[to] = Math.max(obj[to] || 0, obj[from]); delete obj[from]; } };
+  const renameAcct = (from, to) => {
+    for (const t of A.tx) if (t.acct === from) t.acct = to;
+    for (const b of A.imports) if (b.acct === from) b.acct = to;
+    moveKey(delA.acct, from, to);
+  };
+  const renameCat = (from, to) => {
+    for (const t of A.tx) if (t.cat === from) t.cat = to;
+    for (const r of A.recurring) if (r.cat === from) r.cat = to;
+    for (const r of A.rules) if (r.cat === from) r.cat = to;
+    moveKey(delA.cat, from, to);
+  };
+  const renameRec = (from, to) => {
+    const pre = `r_${from}_`;
+    for (const t of A.tx) if (t.rid === from) { t.rid = to; if (t.id.startsWith(pre)) t.id = `r_${to}_` + t.id.slice(pre.length); }
+    for (const k of Object.keys(delA.tx)) if (k.startsWith(pre)) moveKey(delA.tx, k, `r_${to}_` + k.slice(pre.length));
+    moveKey(delA.rec, from, to);
+  };
+
+  /* accounts: same id, or same name */
+  const acctMap = new Map();
+  for (const b of B.accounts) {
+    const a = A.accounts.find(x => x.id === b.id) || A.accounts.find(x => norm(x.name) === norm(b.name));
+    if (a) {
+      if (b.id < a.id) { renameAcct(a.id, b.id); a.id = b.id; }
+      acctMap.set(b.id, a.id);
+      if (stampOf(b) > stampOf(a)) { a.name = b.name; a.upd = b.upd; }
+      a.sigs = [...new Set([...(a.sigs || []), ...(b.sigs || [])])].slice(-12);
+    } else if (!gone(delA.acct, b.id, b)) { A.accounts.push(b); acctMap.set(b.id, b.id); }
+  }
+  for (const [id, ts] of Object.entries(delB.acct)) {
+    const i = A.accounts.findIndex(x => x.id === id);
+    if (i >= 0 && stampOf(A.accounts[i]) <= ts) A.accounts.splice(i, 1);
+  }
+
+  /* categories: same id, or same kind and name */
+  const catMap = new Map();
+  for (const b of B.categories) {
+    const a = A.categories.find(x => x.id === b.id) || A.categories.find(x => x.kind === b.kind && norm(x.name) === norm(b.name));
+    if (a) {
+      if (b.id < a.id && a.id.startsWith('c_') && b.id.startsWith('c_')) { renameCat(a.id, b.id); a.id = b.id; }
+      catMap.set(b.id, a.id);
+      if (a.id !== 'uncat' && stampOf(b) > stampOf(a)) Object.assign(a, { name: b.name, icon: b.icon, budget: b.budget, upd: b.upd }, a.id === b.id ? { kind: b.kind } : {});
+    } else if (gone(delA.cat, b.id, b)) {
+      catMap.set(b.id, 'uncat');
+    } else {
+      const lastSame = A.categories.map(x => x.kind).lastIndexOf(b.kind);
+      A.categories.splice(lastSame + 1, 0, b);
+      catMap.set(b.id, b.id);
+    }
+  }
+  for (const [id, ts] of Object.entries(delB.cat)) {
+    const i = A.categories.findIndex(x => x.id === id);
+    if (i >= 0 && id !== 'uncat' && stampOf(A.categories[i]) <= ts) A.categories.splice(i, 1);
+  }
+  const mapCat = id => catMap.get(id) || 'uncat';
+
+  /* recurring payments: same id, or the same payment set up separately on both devices */
+  const schedule = r => (r.freq === 'weekly' ? toDate(r.start).getDay() : r.freq === 'yearly' ? r.start.slice(5) : r.start.slice(8));
+  const recKey = r => `${r.type}|${r.amount}|${r.freq}|${norm(r.note)}|${schedule(r)}`;
+  const ridMap = new Map();
+  for (const b of B.recurring) {
+    b.cat = mapCat(b.cat);
+    const a = A.recurring.find(x => x.id === b.id) || A.recurring.find(x => recKey(x) === recKey(b));
+    if (a) {
+      if (b.id < a.id) { renameRec(a.id, b.id); a.id = b.id; }
+      ridMap.set(b.id, a.id);
+      const last = [a.last, b.last].filter(Boolean).sort().pop() || null;
+      if (stampOf(b) > stampOf(a)) Object.assign(a, { type: b.type, amount: b.amount, cat: b.cat, note: b.note, freq: b.freq, start: b.start, active: b.active, upd: b.upd });
+      a.last = last;
+    } else if (!gone(delA.rec, b.id, b)) { A.recurring.push(b); ridMap.set(b.id, b.id); }
+  }
+  for (const [id, ts] of Object.entries(delB.rec)) {
+    const i = A.recurring.findIndex(x => x.id === id);
+    if (i >= 0 && stampOf(A.recurring[i]) <= ts) A.recurring.splice(i, 1);
+  }
+
+  // Deletions of recurring payments made on the other device, under the ids used here.
+  for (const k of Object.keys(delB.tx)) {
+    if (!k.startsWith('r_') || k.length < 14) continue;
+    const rid = k.slice(2, -11), to = ridMap.get(rid);
+    if (to && to !== rid) moveKey(delB.tx, k, `r_${to}_` + k.slice(-10));
+  }
+
+  /* entries */
+  const byId = new Map(A.tx.map(t => [t.id, t]));
+  const matched = new Set(), pending = [];
+  for (const b of B.tx) {
+    b.cat = mapCat(b.cat);
+    if (b.acct) { const m = acctMap.get(b.acct); if (m) b.acct = m; else delete b.acct; }
+    if (b.rid && ridMap.has(b.rid) && ridMap.get(b.rid) !== b.rid) {
+      const to = ridMap.get(b.rid), pre = `r_${b.rid}_`;
+      if (b.id.startsWith(pre)) b.id = `r_${to}_` + b.id.slice(pre.length);
+      b.rid = to;
+    }
+    const a = byId.get(b.id);
+    if (a) {
+      matched.add(a.id);
+      if (stampOf(b) > stampOf(a)) {
+        const changed = txSig(a) !== txSig(b);
+        Object.assign(a, { date: b.date, amount: b.amount, type: b.type, cat: b.cat, note: b.note, upd: b.upd });
+        if (b.acct) a.acct = b.acct; else delete a.acct;
+        if (b.bk) a.bk = b.bk; else delete a.bk;
+        if (changed) stats.updated++; else stats.same++;
+      } else stats.same++;
+    } else if (gone(delA.tx, b.id, b)) stats.same++;
+    else pending.push(b);
+  }
+  // Entries only one side has: identical ones are the same entry (both devices imported the statement).
+  const pool = new Map();
+  for (const a of A.tx) {
+    if (matched.has(a.id)) continue;
+    const k = dupKey(a);
+    if (!pool.has(k)) pool.set(k, []);
+    pool.get(k).push(a);
+  }
+  for (const b of pending) {
+    const list = pool.get(dupKey(b));
+    if (list && list.length) {
+      const a = list.shift();
+      if (b.bk && !a.bk) a.bk = b.bk;
+      if (b.id < a.id && !byId.has(b.id)) { byId.delete(a.id); a.id = b.id; byId.set(a.id, a); }   // both devices settle on one id
+      stats.same++;
+    } else { A.tx.push(b); byId.set(b.id, b); stats.added++; }
+  }
+  // Deleted on the other device since we last changed them.
+  const drop = new Set();
+  for (const [id, ts] of Object.entries(delB.tx)) { const a = byId.get(id); if (a && stampOf(a) <= ts) drop.add(id); }
+  if (drop.size) { A.tx = A.tx.filter(t => !drop.has(t.id)); stats.removed += drop.size; }
+
+  /* rules: one per piece of text; new ones from the other device go on top */
+  const aRules = new Map(A.rules.map(r => [ruleKey(r), r]));
+  const fresh = [];
+  for (const b of B.rules) {
+    const c = catMap.get(b.cat);
+    if (!c || c === 'uncat') continue;
+    b.cat = c;
+    const k = ruleKey(b), a = aRules.get(k);
+    if (a) { if (stampOf(b) > stampOf(a)) { a.cat = b.cat; a.upd = b.upd; } }
+    else if (!gone(delA.rule, k, b)) { fresh.push(b); aRules.set(k, b); }
+  }
+  A.rules = [...fresh, ...A.rules];
+  for (const [k, ts] of Object.entries(delB.rule)) {
+    const a = aRules.get(k);
+    if (a && stampOf(a) <= ts) A.rules = A.rules.filter(r => r !== a);
+  }
+
+  /* the rest */
+  const impIds = new Set(A.imports.map(x => x.id));
+  for (const b of B.imports) {
+    if (impIds.has(b.id)) continue;
+    if (b.acct) { const m = acctMap.get(b.acct); if (m) b.acct = m; else delete b.acct; }
+    A.imports.push(b);
+  }
+  A.imports.sort((x, y) => String(y.at).localeCompare(String(x.at)));
+  A.dismissed = [...new Set([...(A.dismissed || []), ...(B.dismissed || [])])].slice(-3000);
+  const bLimit = B.settings.limitUpd || 0, aLimit = A.settings.limitUpd || 0;
+  if (bLimit > aLimit || (bLimit === aLimit && A.settings.limit == null && B.settings.limit != null)) {
+    A.settings.limit = B.settings.limit; A.settings.limitUpd = bLimit;
+  }
+  A.settings.clock = Math.max(A.settings.clock || 0, B.settings.clock || 0);
+  for (const kind of DELETED_KINDS) {
+    for (const [k, ts] of Object.entries(delB[kind])) if (!(delA[kind][k] >= ts)) delA[kind][k] = ts;
+  }
+  // A record that exists again is no longer "deleted".
+  const present = { tx: new Set(A.tx.map(t => t.id)), cat: new Set(A.categories.map(c => c.id)), rec: new Set(A.recurring.map(r => r.id)), rule: new Set(A.rules.map(ruleKey)), acct: new Set(A.accounts.map(a => a.id)) };
+  for (const kind of DELETED_KINDS) for (const k of Object.keys(delA[kind])) if (present[kind].has(k)) delete delA[kind][k];
+
+  return { state: normalizeState(A), stats };
+}
+
+/* ---------- bringing in a backup ---------- */
+async function restoreFromText(text) {
+  let next, exported = null;
+  try {
+    const raw = JSON.parse(text);
+    next = normalizeState(raw);
+    exported = typeof raw.exported === 'string' ? raw.exported : null;
+  } catch (err) { toast(err instanceof SyntaxError ? "That isn't a Spend Control backup." : err.message); return; }
+  const hasLocal = state.tx.length > 0 || state.recurring.length > 0;
+  if (!hasLocal) { applyRestore(next, exported, 'Backup restored.'); return; }
+
+  const m = mergeStates(state, next), st = m.stats;
+  const bits = [];
+  if (st.added) bits.push(`add ${plural(st.added, 'entry', 'entries')}`);
+  if (st.updated) bits.push(`update ${st.updated}`);
+  if (st.removed) bits.push(`remove ${st.removed} that ${st.removed === 1 ? 'was' : 'were'} deleted on the other device`);
+  const when = exported ? `, saved ${fmtDayAuto(exported.slice(0, 10))}` : '';
+  const mergeLine = bits.length
+    ? `<b>Merge</b> keeps what's here and brings in what's new from the backup. It would ${bits.join(', ').replace(/, ([^,]*)$/, ' and $1')}.`
+    : "<b>Merge</b> keeps what's here and brings in what's new from the backup. The entries already match, so only settings such as budgets and rules could change.";
+  ui.pendingRestore = { next, exported, merged: m.state, stats: st };
+  openModal({
+    title: 'Bring in this backup',
+    body: `<p>The backup has ${plural(next.tx.length, 'entry', 'entries')}${when}. This device has ${plural(state.tx.length, 'entry', 'entries')}.</p>
+      <p>${mergeLine}</p>
+      <p><b>Replace</b> throws away what's here and uses the backup alone.</p>
+      <p class="hint">Either way, you can undo it straight after, and today's earlier state stays under Data, Earlier versions.</p>`,
+    foot: '<button type="button" class="btn" data-act="modal-close">Cancel</button><button type="button" class="btn danger" data-act="restore-replace">Replace everything</button><button type="button" class="btn primary" data-act="restore-merge" autofocus>Merge</button>',
+    onClose: () => { ui.pendingRestore = null; },
+  });
+}
+function replaceState(s, next) {
+  for (const k of Object.keys(s)) delete s[k];
+  Object.assign(s, next);
+}
+function applyRestore(next, exported, msg) {
+  snapshotBefore('Before restoring a backup');
+  next.settings.lastBackup = exported || new Date().toISOString();
+  next.settings.changes = 0;
+  commit(s => { replaceState(s, next); runRecurring(s); }, msg, [], { raw: true });
+  nfCache.clear(); applyTheme(); render();
+  offerReview();
+}
+ACT['restore-replace'] = el => {
+  const p = ui.pendingRestore;
+  if (!p) return;
+  el.closest('dialog')?.close('ok');
+  applyRestore(p.next, p.exported, 'Backup restored. It replaced what was here.');
+};
+ACT['restore-merge'] = el => {
+  const p = ui.pendingRestore;
+  if (!p) return;
+  el.closest('dialog')?.close('ok');
+  snapshotBefore('Before merging a backup');
+  const keep = { lastBackup: state.settings.lastBackup, changes: state.settings.changes };
+  const st = p.stats;
+  const did = [st.added && `${st.added} added`, st.updated && `${st.updated} updated`, st.removed && `${st.removed} removed`].filter(Boolean).join(', ');
+  commit(s => { replaceState(s, p.merged); Object.assign(s.settings, keep); runRecurring(s); }, `Backup merged${did ? `: ${did}` : '. Nothing new'}.`, [], { raw: true });
+  offerReview();
+};
+
+/* ---------- earlier versions ---------- */
+function snapshotList() {
+  const todayKey = 'd:' + today();
+  return store.snaps.filter(x => x.key !== todayKey).sort((a, b) => {
+    const ta = a.key.startsWith('d:') ? toDate(a.key.slice(2)).getTime() + DAY_MS - 1 : a.at;
+    const tb = b.key.startsWith('d:') ? toDate(b.key.slice(2)).getTime() + DAY_MS - 1 : b.at;
+    return tb - ta;
+  });
+}
+function snapshotLabel(x) {
+  if (x.key.startsWith('d:')) return `End of ${fmtDayAuto(x.key.slice(2))}`;
+  const d = new Date(x.at);
+  return `${x.label || 'Before a change'}, ${fmtDayAuto(ymd(d.getFullYear(), d.getMonth() + 1, d.getDate()))} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+ACT['snap-restore'] = async el => {
+  const x = store.snaps.find(s => s.key === el.dataset.key);
+  if (!x) return;
+  const ok = await confirmModal({
+    title: 'Go back to this version?',
+    body: `Everything here now (${plural(state.tx.length, 'entry', 'entries')}) will be replaced by how things stood at: ${esc(snapshotLabel(x))}, with ${plural(x.n, 'entry', 'entries')}. You can undo it straight after.`,
+    ok: 'Go back to it',
+  });
+  if (!ok) return;
+  let next;
+  try { next = normalizeState(JSON.parse(await idbRun('snaps', 'readonly', s => s.get(x.key)))); }
+  catch { toast("That version couldn't be read."); return; }
+  snapshotBefore('Before going back to an earlier version');
+  const keep = { lastBackup: state.settings.lastBackup };
+  commit(s => { replaceState(s, next); Object.assign(s.settings, keep); runRecurring(s); }, 'Went back to the earlier version.', [], { raw: true });
+  nfCache.clear(); applyTheme(); render();
+};
+
+/* =========================================================================
+   Review: pairs of entries that would count money twice.
+     - duplicates: something you typed (or a recurring payment) that also
+       came in from a bank statement
+     - transfers: money leaving one of your accounts and arriving in another
+   Nothing is changed until you confirm a pair.
+   ========================================================================= */
+let reviewCache = { rev: -1, pairs: null };
+const acctKey = t => (t.acct ? 'a:' + t.acct : t.batch ? 'b:' + t.batch : '');
+function acctName(t) {
+  if (t.acct) { const a = state.accounts.find(x => x.id === t.acct); if (a) return a.name; }
+  if (t.batch) { const b = state.imports.find(x => x.id === t.batch); if (b) return b.file; }
+  return '';
+}
+
+function reviewPairs() {
+  if (reviewCache.rev === dataRev && reviewCache.pairs) return reviewCache.pairs;
+  const dismissed = new Set(state.dismissed);
+  const dups = [], transfers = [];
+  const push = (map, k, v) => { if (!map.has(k)) map.set(k, []); map.get(k).push(v); };
+
+  /* duplicates: yours vs imported, same direction and amount, bank date -3..+7 days from yours */
+  const imported = new Map();
+  for (const t of state.tx) if (t.src === 'import') push(imported, `${t.type}|${t.amount}`, t);
+  const cand = [];
+  for (const m of state.tx) {
+    if (m.src === 'import' || m.src === 'demo' || m.bk) continue;
+    for (const i of imported.get(`${m.type}|${m.amount}`) || []) {
+      const d = daysBetween(m.date, i.date);
+      if (d < (m.rid ? -7 : -3) || d > 7) continue;
+      const key = `d:${m.id}|${i.id}`;
+      if (!dismissed.has(key)) cand.push({ kind: 'd', a: m, b: i, key, score: d >= 0 ? d : 0.5 - d });
+    }
+  }
+  cand.sort((x, y) => x.score - y.score);
+  const used = new Set();
+  for (const p of cand) {
+    if (used.has(p.a.id) || used.has(p.b.id)) continue;
+    used.add(p.a.id); used.add(p.b.id);
+    dups.push(p);
+  }
+
+  /* transfers: out of one account, into another, same amount, within 3 days */
+  const ins = new Map();
+  for (const t of state.tx) {
+    if (t.type !== 'income' || used.has(t.id) || !acctKey(t)) continue;
+    const k = cat(t.cat).kind;
+    if (k === 'auto' || k === 'transfer') push(ins, t.amount, t);
+  }
+  const tc = [];
+  for (const e of state.tx) {
+    if (e.type !== 'expense' || used.has(e.id) || !acctKey(e)) continue;
+    const ek = cat(e.cat).kind;
+    for (const i of ins.get(e.amount) || []) {
+      if (acctKey(i) === acctKey(e)) continue;
+      const ik = cat(i.cat).kind;
+      if (ek === 'transfer' && ik === 'transfer') continue;
+      const d = Math.abs(daysBetween(e.date, i.date));
+      if (d > 3) continue;
+      // A payment already filed under a spending category only counts if it names the other account.
+      const other = acctName(i);
+      if (ek !== 'auto' && ek !== 'transfer' && !(ek === 'expense' && i.acct && other && textMatches(other, e.note))) continue;
+      const key = `t:${e.id}|${i.id}`;
+      if (!dismissed.has(key)) tc.push({ kind: 't', a: e, b: i, key, score: d });
+    }
+  }
+  tc.sort((x, y) => x.score - y.score);
+  const usedT = new Set();
+  for (const p of tc) {
+    if (usedT.has(p.a.id) || usedT.has(p.b.id)) continue;
+    usedT.add(p.a.id); usedT.add(p.b.id);
+    transfers.push(p);
+  }
+  const byDate = (x, y) => y.a.date.localeCompare(x.a.date);
+  reviewCache = { rev: dataRev, pairs: { dups: dups.sort(byDate), transfers: transfers.sort(byDate) } };
+  return reviewCache.pairs;
+}
+function reviewCount() { const p = reviewPairs(); return p.dups.length + p.transfers.length; }
+
+/* After an import or a merge: say so if something needs a look. */
+function offerReview() {
+  const p = reviewPairs(), n = p.dups.length + p.transfers.length;
+  if (!n) return;
+  const what = [p.transfers.length && plural(p.transfers.length, 'possible transfer'), p.dups.length && plural(p.dups.length, 'possible duplicate')].filter(Boolean).join(' and ');
+  toast(`${what} to check, so money isn't counted twice.`, [{ label: 'Review', run: openReviewModal }]);
+}
+
+function reviewRowHTML(t) {
+  const c = cat(t.cat), inc = t.type === 'income';
+  const where = t.src === 'import' ? (acctName(t) || 'Imported') : t.rid ? 'Recurring payment' : 'Typed by you';
+  return `<div class="rv-row"><span class="ico" aria-hidden="true">${esc(c.icon)}</span><span class="rv-note">${esc(t.note || c.name)}<span class="rv-sub">${esc(fmtDayAuto(t.date))}, ${esc(where)}, ${esc(c.name)}</span></span><span class="rv-amt${inc ? ' in' : ''}">${money(inc ? t.amount : -t.amount, { sign: inc })}</span></div>`;
+}
+function reviewBodyHTML() {
+  const p = reviewPairs();
+  if (!p.dups.length && !p.transfers.length) return '<p>Nothing left to check.</p>';
+  const section = (title, lede, list, yes, no, allLabel, allAct) => {
+    if (!list.length) return '';
+    const items = list.slice(0, 30).map(x => `<div class="rv-pair">${reviewRowHTML(x.a)}${reviewRowHTML(x.b)}
+      <div class="rv-actions"><button type="button" class="btn sm primary" data-act="rv-yes" data-pair="${esc(x.key)}">${yes}</button><button type="button" class="btn sm" data-act="rv-no" data-pair="${esc(x.key)}">${no}</button></div></div>`).join('');
+    return `<section class="rv-sec"><h3>${title}</h3><p class="hint">${lede}</p>${items}
+      ${list.length > 30 ? `<p class="hint">Showing 30 of ${list.length}.</p>` : ''}
+      ${list.length > 1 ? `<div class="rv-all"><button type="button" class="btn sm" data-act="${allAct}">${allLabel} (${list.length})</button></div>` : ''}</section>`;
+  };
+  return section('Transfers between your accounts', 'The same amount left one account and arrived in another. As a transfer, neither side counts as spending or income.', p.transfers, "It's a transfer", 'Not a transfer', 'All of these are transfers', 'rv-all-t')
+    + section('The same payment twice', 'An entry you added and a row from a statement look like one payment. Keeping one removes the statement row and keeps your entry.', p.dups, 'Same payment, keep one', 'Two different payments', 'All of these are the same payment', 'rv-all-d');
+}
+function openReviewModal() {
+  openModal({ title: 'Check for double counting', wide: true, body: `<div id="review-body">${reviewBodyHTML()}</div>`, foot: '<button type="button" class="btn" data-act="modal-close">Done</button>' });
+}
+function refreshReview() {
+  const host = $('#review-body');
+  if (host) host.innerHTML = reviewBodyHTML();
+}
+ACT['review-open'] = () => openReviewModal();
+
+function transferCatId(s) {
+  let c = s.categories.find(x => x.id === 'transfer' && x.kind === 'transfer') || s.categories.find(x => x.kind === 'transfer');
+  if (!c) { c = { id: 'c_' + uid(), name: 'Transfers & savings', icon: '↔️', kind: 'transfer', budget: null }; s.categories.push(c); }
+  return c.id;
+}
+function resolvePairs(list, yes) {
+  if (!list.length) return;
+  const kind = list[0].kind;
+  if (!yes) {
+    commit(s => { s.dismissed = [...s.dismissed, ...list.map(p => p.key)].slice(-3000); }, kind === 't' ? 'Left as it is.' : 'Kept both.');
+  } else if (kind === 't') {
+    commit(s => {
+      const to = transferCatId(s), ids = new Set(list.flatMap(p => [p.a.id, p.b.id]));
+      for (const t of s.tx) if (ids.has(t.id)) t.cat = to;
+    }, `${plural(list.length, 'transfer')} marked. ${list.length === 1 ? 'It no longer counts' : 'They no longer count'} as spending or income.`);
+  } else {
+    commit(s => {
+      const byId = new Map(s.tx.map(t => [t.id, t])), drop = new Set();
+      for (const p of list) {
+        const mine = byId.get(p.a.id), bank = byId.get(p.b.id);
+        if (!mine || !bank) continue;
+        mine.bk = bank.bk || dupKey(bank);
+        if (bank.acct && !mine.acct) mine.acct = bank.acct;
+        if (mine.cat === 'uncat' && bank.cat !== 'uncat') mine.cat = bank.cat;
+        drop.add(bank.id);
+      }
+      s.tx = s.tx.filter(t => !drop.has(t.id));
+    }, `${plural(list.length, 'duplicate')} removed.`);
+  }
+  refreshReview();
+}
+const findPair = key => { const p = reviewPairs(); return [...p.dups, ...p.transfers].find(x => x.key === key); };
+ACT['rv-yes'] = el => { const p = findPair(el.dataset.pair); if (p) resolvePairs([p], true); };
+ACT['rv-no'] = el => { const p = findPair(el.dataset.pair); if (p) resolvePairs([p], false); };
+ACT['rv-all-t'] = () => resolvePairs(reviewPairs().transfers, true);
+ACT['rv-all-d'] = () => resolvePairs(reviewPairs().dups, true);
+
+/* =========================================================================
    Start-up
    ========================================================================= */
-/* Ask the browser to keep this app's storage even when space runs low. */
+/* Ask the browser to keep this app's storage even when space runs low.
+   store.persisted: true = protected, false = may be cleared, null = unknown. */
 let persistAsked = false;
-function askPersist() {
-  if (persistAsked || !state.tx.length || !(navigator.storage && navigator.storage.persist)) return;
-  persistAsked = true;
-  navigator.storage.persisted().then(p => p || navigator.storage.persist()).catch(() => { /* not supported */ });
+store.persisted = null;
+async function checkPersisted() {
+  try { store.persisted = navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted() : null; }
+  catch { store.persisted = null; }
+  return store.persisted;
 }
-function boot() {
-  state = loadState();
+async function askPersist(force = false) {
+  if (!(navigator.storage && navigator.storage.persist)) return null;
+  if (!force && (persistAsked || !state.tx.length)) return store.persisted;
+  persistAsked = true;
+  try {
+    const was = store.persisted;
+    store.persisted = (await navigator.storage.persisted()) || (await navigator.storage.persist());
+    if (was !== store.persisted && ui.tab === 'data') render();
+  } catch { /* not supported here */ }
+  return store.persisted;
+}
+
+/* "#add" (the home-screen shortcut) opens the new-entry form straight away. */
+function handleAddShortcut() {
+  if (!ui.wantAdd) return;
+  ui.wantAdd = false;
+  try { history.replaceState(null, '', location.pathname + location.search + '#overview'); } catch { /* fine */ }
+  if (!document.querySelector('dialog[open]')) openEntryModal();
+}
+
+async function boot() {
+  state = await loadState();
   reindex();
-  if (runRecurring(state)) persist();
+  if (runRecurring(state) || store.resync) persist();
   applyTheme();
   route();
   render();
+  handleAddShortcut();
   getDownloads();
   if (WEB_APP && HOSTED && !inClaude()) {
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => { /* offline mode unavailable */ });
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => { /* offline mode unavailable */ });
     window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; renderBanners(); });
     window.addEventListener('appinstalled', () => { installEvt = null; renderBanners(); });
-    askPersist();
+    checkPersisted().then(() => askPersist()).then(() => { if (ui.tab === 'data') render(); });
   }
   let lastDay = today();
-  window.addEventListener('hashchange', () => { route(); hideTip(); render(); window.scrollTo(0, 0); });
+  window.addEventListener('hashchange', () => { route(); hideTip(); render(); window.scrollTo(0, 0); handleAddShortcut(); });
   window.addEventListener('storage', e => {
     if (e.key !== STORE_KEY || e.newValue == null) return;
-    try { state = normalizeState(JSON.parse(e.newValue)); reindex(); nfCache.clear(); applyTheme(); render(); } catch { /* ignore */ }
+    try { state = normalizeState(JSON.parse(e.newValue)); dataRev++; reindex(); nfCache.clear(); applyTheme(); render(); } catch { /* ignore */ }
   });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
@@ -3567,7 +4443,10 @@ function boot() {
     }
   });
 }
-boot();
+boot().catch(err => {
+  const view = document.getElementById('view');
+  if (view) view.textContent = "Spend Control couldn't start. Reload the page. If it keeps happening, your entries are still on this device; bring in your latest backup after reloading. (" + (err && err.message ? err.message : err) + ')';
+});
 
 })();
 </script>

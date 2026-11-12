@@ -1,7 +1,7 @@
 /* Spend Control service worker.
    Keeps the app itself available offline. It never sees or sends your entries:
    those stay in this device's browser storage. */
-const CACHE = 'spend-control-v1';
+const CACHE = 'spend-control-v2';
 const SHELL = [
   './',
   './index.html',
