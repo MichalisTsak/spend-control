@@ -3301,9 +3301,25 @@ function detectHeaderRow(rows) {
   }
   return bestScore >= 2 ? best : -1;
 }
+/* Is this cell a debit or a credit marker? ("Χρέωση", "Πίστωση", "Χ", "Π", "D", "CR"...) */
+function dcKind(v) {
+  const n = norm(v);
+  if (!n) return null;
+  if (DC_IN.has(n) || n.startsWith('πιστ') || n.startsWith('credit')) return 'income';
+  if (DC_OUT.has(n) || n.startsWith('χρεω') || n.startsWith('debit')) return 'expense';
+  return null;
+}
+/* A header naming both sides, like "Χρέωση / Πίστωση", is a marker column, not an amount. */
+function isMarkerHeader(h) {
+  if (typeof h !== 'string') return false;
+  const n = norm(h);
+  return /^(χ\s*\/\s*π|d\s*\/\s*c|dr\s*\/\s*cr|c\s*\/\s*d)$/.test(n) || (headScore(h, HEAD.debit) >= 1 && headScore(h, HEAD.credit) >= 1);
+}
 function guessColumns(header, data) {
   const ncol = Math.max(header.length, ...data.slice(0, 60).map(r => r.length), 0);
   const used = new Set();
+  let dc = header.findIndex(isMarkerHeader);
+  if (dc >= 0) used.add(dc);
   const byHeader = (role, ok = () => true) => {
     let best = -1, bs = 1;
     for (let i = 0; i < header.length; i++) {
@@ -3333,11 +3349,10 @@ function guessColumns(header, data) {
     }
     if (date >= 0) used.add(date);
   }
-  let dc = -1;
-  for (let i = 0; i < ncol; i++) {
+  for (let i = 0; i < ncol && dc < 0; i++) {
     if (used.has(i)) continue;
-    const vals = colVals(i).map(v => norm(v));
-    if (vals.length >= 2 && vals.filter(v => DC_OUT.has(v) || DC_IN.has(v)).length / vals.length >= 0.8) { dc = i; used.add(i); break; }
+    const vals = colVals(i);
+    if (vals.length >= 2 && vals.filter(v => dcKind(v)).length / vals.length >= 0.8) { dc = i; used.add(i); }
   }
   if (amount < 0 && debit < 0 && credit < 0) {
     for (let i = 0; i < ncol; i++) {
@@ -3370,6 +3385,9 @@ function findCol(header, words) {
   header.forEach((h, i) => { const sc = headScore(h, words); if (sc > bs) { bs = sc; best = i; } });
   return best;
 }
+const isCardDateHeader = h => { const n = norm(h); return (n.includes('ημερομηνια') && n.includes('καρτα')) || (n.includes('date') && n.includes('card')); };
+const isPartyHeader = h => { const n = norm(h); return (n.includes('αντισυμβαλλ') && (n.includes('ονομα') || n.includes('επωνυμ'))) || ['counterparty', 'counterparty name', 'merchant', 'merchant name', 'payee', 'beneficiary', 'δικαιουχοσ', 'εμποροσ', 'επωνυμια εμπορου'].includes(n); };
+const isInfoHeader = h => { const n = norm(h); return n.startsWith('επιπροσθετεσ πληροφορ') || n === 'additional information' || n === 'additional info'; };
 function importConfig(rows, headerRow) {
   const header = headerRow >= 0 ? rows[headerRow] || [] : [];
   const data = rows.slice(headerRow + 1).filter(r => r && r.some(c => c !== '' && c != null));
@@ -3377,10 +3395,14 @@ function importConfig(rows, headerRow) {
   const cfg = {
     headerRow, dateCol: g.date, descCol: g.desc, amountCol: g.amount, debitCol: g.debit, creditCol: g.credit, dcCol: g.dc, stateCol: g.stateCol,
     curCol: findCol(header, HEAD_CUR), feeCol: findCol(header, HEAD_FEE),
+    date2Col: header.findIndex((h, i) => i !== g.date && typeof h === 'string' && isCardDateHeader(h)), date2Fmt: 'dmy',
+    desc2Col: header.findIndex((h, i) => i !== g.desc && typeof h === 'string' && isPartyHeader(h)),
+    desc3Col: header.findIndex((h, i) => i !== g.desc && typeof h === 'string' && isInfoHeader(h)),
     mode: g.mode, dateFmt: 'dmy', dec: '.', sign: 'negout', includeIncome: true, skipMatched: true, rates: {}, acct: '', acctName: '',
   };
   if (cfg.mode === 'split' && cfg.amountCol >= 0 && cfg.debitCol < 0 && cfg.creditCol < 0) cfg.mode = 'signed';
   cfg.dateFmt = cfg.dateCol >= 0 ? detectDateFormat(data.map(r => r[cfg.dateCol])) : 'dmy';
+  if (cfg.date2Col >= 0) cfg.date2Fmt = detectDateFormat(data.map(r => r[cfg.date2Col]));
   const amountCols = cfg.mode === 'split' ? [cfg.debitCol, cfg.creditCol] : [cfg.amountCol];
   cfg.dec = detectDecimal(amountCols.filter(i => i >= 0).flatMap(i => data.map(r => r[i])));
   if (cfg.mode === 'signed' && cfg.amountCol >= 0) {
@@ -3402,6 +3424,7 @@ function guessAccount(imp) {
   const text = norm(imp.file) + ' ' + sig;
   let name = (KNOWN_BANKS.find(([k]) => text.includes(k)) || [])[1];
   if (!name && sig.includes('started date') && sig.includes('completed date')) name = 'Revolut';
+  if (!name && sig.includes('α/α συναλλαγησ') && sig.includes('valeur')) name = 'NBG';
   const same = name && state.accounts.find(a => norm(a.name) === norm(name));
   if (same) { cfg.acct = same.id; cfg.acctName = ''; return; }
   cfg.acct = '__new';
@@ -3418,8 +3441,13 @@ function buildImport(rows, cfg) {
   for (let i = cfg.headerRow + 1; i < rows.length; i++) {
     const r = rows[i];
     if (!r || !r.some(c => c !== '' && c != null)) continue;
-    const date = cfg.dateCol >= 0 ? parseDateWith(r[cfg.dateCol], cfg.dateFmt) : null;
+    let date = cfg.dateCol >= 0 ? parseDateWith(r[cfg.dateCol], cfg.dateFmt) : null;
     if (!date) { skipped.noDate++; continue; }
+    // A card purchase is dated when you paid, not when the bank booked it a few days later.
+    if (cfg.date2Col >= 0) {
+      const d2 = parseDateWith(r[cfg.date2Col], cfg.date2Fmt);
+      if (d2) { const gap = daysBetween(d2, date); if (gap >= 0 && gap <= 10) date = d2; }
+    }
     const st = cfg.stateCol >= 0 ? String(r[cfg.stateCol] ?? '') : '';
     if (st && /revert|declin|fail|cancel|ακυρ|απορρ/i.test(st)) { skipped.reverted++; continue; }
     if (st && /pending|εκκρεμ/i.test(st)) { skipped.pending++; continue; }
@@ -3431,8 +3459,8 @@ function buildImport(rows, cfg) {
       else if (Number.isFinite(cv) && cv !== 0) { v = Math.abs(cv); type = 'income'; }
     } else if (cfg.mode === 'dc') {
       const a = cfg.amountCol >= 0 ? parseAmount(r[cfg.amountCol], cfg.dec) : NaN;
-      const ind = norm(cfg.dcCol >= 0 ? r[cfg.dcCol] : '');
-      if (Number.isFinite(a) && a !== 0) { v = Math.abs(a); type = DC_IN.has(ind) ? 'income' : 'expense'; }
+      const ind = cfg.dcCol >= 0 ? dcKind(r[cfg.dcCol]) : null;
+      if (Number.isFinite(a) && a !== 0) { v = Math.abs(a); type = ind === 'income' ? 'income' : 'expense'; }
     } else {
       const a = cfg.amountCol >= 0 ? parseAmount(r[cfg.amountCol], cfg.dec) : NaN;
       if (Number.isFinite(a) && a !== 0) { v = Math.abs(a); type = (cfg.sign === 'negout' ? a < 0 : a > 0) ? 'expense' : 'income'; }
@@ -3443,6 +3471,10 @@ function buildImport(rows, cfg) {
     if (fee > 0) v = type === 'expense' ? v + fee : Math.max(0, v - fee);
     if (type === 'income' && !cfg.includeIncome) { skipped.income++; continue; }
     let note = cleanDesc(cfg.descCol >= 0 ? r[cfg.descCol] : '');
+    // The shop or person often sits in its own column; add it so rules and searches can see it.
+    const party = cfg.desc2Col >= 0 ? cleanDesc(r[cfg.desc2Col]) : '';
+    if (party && !norm(note).includes(norm(party))) note = (note ? `${note}, ${party}` : party).slice(0, 200);
+    if (!note && cfg.desc3Col >= 0) note = cleanDesc(r[cfg.desc3Col]);
     // Rows in another currency need a rate, or they are left out.
     const cur = cfg.curCol >= 0 ? String(r[cfg.curCol] ?? '').trim().toUpperCase() : '';
     if (/^[A-Z]{3}$/.test(cur) && cur !== home) {
@@ -3640,6 +3672,8 @@ function importBodyHTML() {
       <label>Date column${sel('dateCol', colOpts(cfg.dateCol))}</label>
       <label>Date format${sel('dateFmt', opt('dmy', 'Day/month/year (31/12/2026)', cfg.dateFmt) + opt('mdy', 'Month/day/year (12/31/2026)', cfg.dateFmt) + opt('ymd', 'Year-month-day (2026-12-31)', cfg.dateFmt) + opt('excel', 'Excel date number', cfg.dateFmt) + opt('text', 'Written out (31 Dec 2026)', cfg.dateFmt))}</label>
       <label>Description column${sel('descCol', colOpts(cfg.descCol, 'None'))}</label>
+      <label>Shop or person column, added to the description${sel('desc2Col', colOpts(cfg.desc2Col, 'None'))}</label>
+      <label>Card purchase date column, used when filled in${sel('date2Col', colOpts(cfg.date2Col, 'None'))}</label>
       <label>Amounts are in${sel('mode', opt('signed', 'One column with + and −', cfg.mode) + opt('split', 'Separate out and in columns', cfg.mode) + opt('dc', 'One column plus a Χ/Π or D/C marker', cfg.mode))}</label>
       ${amountFields}
       <label>Decimal mark${sel('dec', opt(',', 'Comma (12,50)', cfg.dec) + opt('.', 'Point (12.50)', cfg.dec))}</label>
@@ -3685,6 +3719,7 @@ function importChanged(el, imp) {
   else {
     cfg[name] = +el.value;
     if (name === 'dateCol' && cfg.dateCol >= 0) cfg.dateFmt = detectDateFormat(imp.rows.slice(cfg.headerRow + 1).map(r => r && r[cfg.dateCol]));
+    if (name === 'date2Col' && cfg.date2Col >= 0) cfg.date2Fmt = detectDateFormat(imp.rows.slice(cfg.headerRow + 1).map(r => r && r[cfg.date2Col]));
   }
   refreshImportModal();
   const again = $(`dialog.modal[open] [name="${CSS.escape(name)}"]`);
