@@ -457,7 +457,7 @@ textarea.copy-box { width: 100%; height: auto; min-height: 150px; margin-top: 10
   .imp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 900px) {
-  .ov { display: flex; flex-direction: column; }
+  .ov { display: flex; flex-direction: column; align-items: stretch; }
   .ov-main, .ov-side { display: contents; }
   .o-hero { order: 1; } .o-kpis { order: 2; } .o-entry { order: 3; } .o-welcome { order: 4; } .o-notes { order: 5; }
   .o-pace { order: 6; } .o-cats { order: 7; } .o-upcoming { order: 8; } .o-latest { order: 9; }
@@ -538,6 +538,19 @@ details.fold[open] > summary { margin-bottom: 4px; }
 .imp-top { margin-bottom: 0; }
 .imp-cols { margin-top: 14px; }
 .imp-cols > summary { margin-top: 0; }
+
+/* ---------- shared expenses ---------- */
+.shared-link { justify-self: start; font-size: 13px; }
+.shared { display: grid; gap: 8px; padding: 10px 12px; border: 1px solid var(--rule); border-radius: 10px; background: var(--page); }
+.shared-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; font-size: 13.5px; }
+.shared-row .money-in input { width: 96px; }
+.split { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chip.sm { height: 28px; min-width: 34px; padding: 0 10px; justify-content: center; font-variant-numeric: tabular-nums; }
+.shared .link { justify-self: start; font-size: 12.5px; }
+.shared-note { min-height: 1.4em; }
+.owed-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+@media (max-width: 900px) { .o-owed { order: 5; } }
+@media (max-width: 760px) { .owed-actions .btn { flex: 1 1 100%; } }
 
 </style>
 </head>
@@ -840,6 +853,7 @@ let state = null;
 let storageOK = true;
 let loadProblem = null;
 let catIndex = new Map();
+let txIndex = new Map();
 let compiledRules = null;
 let commitGen = 0;
 let dataRev = 0;                 // bumps on every save; used to cache derived lists
@@ -946,6 +960,9 @@ function normalizeState(raw) {
     };
     if (typeof t.acct === 'string' && acctIds.has(t.acct)) out.acct = t.acct;
     if (typeof t.bk === 'string' && t.bk) out.bk = t.bk.slice(0, 300);
+    const owed = out.type === 'expense' ? posInt(t.owed) : null;      // the part friends pay back
+    if (owed) out.owed = Math.min(owed, amount);
+    if (out.type === 'income' && typeof t.pay === 'string' && t.pay) out.pay = t.pay;   // money back for that expense
     st.tx.push(withUpd(out, t));
   }
   st.recurring = [];
@@ -1116,12 +1133,13 @@ function snapshotBefore(label) { return saveSnapshot('b:' + Date.now(), label, J
 
 function reindex() {
   catIndex = new Map(state.categories.map(c => [c.id, c]));
+  txIndex = new Map(state.tx.map(t => [t.id, t]));
   compiledRules = null;
 }
 const cat = id => catIndex.get(id) || catIndex.get('uncat');
 
 /* ---------- change tracking ---------- */
-const txSig = t => `${t.date}|${t.amount}|${t.type}|${t.cat}|${t.note}|${t.acct || ''}|${t.bk || ''}`;
+const txSig = t => `${t.date}|${t.amount}|${t.type}|${t.cat}|${t.note}|${t.acct || ''}|${t.bk || ''}|${t.owed || ''}|${t.pay || ''}`;
 const catSig = c => `${c.name}|${c.icon}|${c.kind}|${c.budget}`;
 const recSig = r => `${r.type}|${r.amount}|${r.cat}|${r.note}|${r.freq}|${r.start}|${r.active}`;
 const ruleKey = r => norm(r.match);
@@ -1245,6 +1263,48 @@ function incomeDelta(type, amount, c) {
   if (c.kind === 'auto') return type === 'income' ? amount : 0;
   return 0;
 }
+/* ---------- shared expenses ----------
+   An expense can carry `owed`: the part friends will pay back. Only your share counts as
+   spending. Money that comes back points at the expense with `pay`; it settles what is
+   owed and counts as neither income nor a refund. */
+function payTarget(t) {
+  const x = t.pay ? txIndex.get(t.pay) : null;
+  return x && x.type === 'expense' ? x : null;
+}
+function txSpend(t, c = cat(t.cat)) {
+  if (t.pay && payTarget(t)) return 0;
+  return spendDelta(t.type, t.type === 'expense' && t.owed ? Math.max(0, t.amount - t.owed) : t.amount, c);
+}
+function txIncome(t, c = cat(t.cat)) {
+  if (t.pay && payTarget(t)) return 0;
+  return incomeDelta(t.type, t.amount, c);
+}
+let sharedCache = { rev: -1, list: null };
+/* Every shared expense with how much has come back and how much is still open. */
+function sharedList() {
+  if (sharedCache.rev === dataRev && sharedCache.list) return sharedCache.list;
+  const back = new Map();
+  for (const t of state.tx) if (t.pay && payTarget(t)) back.set(t.pay, (back.get(t.pay) || 0) + t.amount);
+  const list = [];
+  for (const t of state.tx) {
+    if (t.type !== 'expense' || !t.owed) continue;
+    const got = back.get(t.id) || 0;
+    list.push({ t, owed: t.owed, back: got, open: Math.max(0, t.owed - got) });
+  }
+  list.sort((a, b) => b.t.date.localeCompare(a.t.date) || b.t.created - a.t.created);
+  sharedCache = { rev: dataRev, list };
+  return list;
+}
+const sharedOpen = () => sharedList().filter(x => x.open > 0);
+/* Tie a payment that came in to the expense it pays back. */
+function linkRepayment(s, pay, exp) {
+  pay.pay = exp.id;
+  const c = s.categories.find(x => x.id === exp.cat);
+  if (c && c.kind === 'expense') pay.cat = exp.cat;
+  const total = sumBy(s.tx.filter(t => t.pay === exp.id), t => t.amount);
+  exp.owed = Math.min(exp.amount, Math.max(exp.owed || 0, total));
+}
+
 function budgetTotal() { return sumBy(state.categories.filter(c => c.kind === 'expense'), c => c.budget || 0); }
 function effectiveLimit() {
   if (state.settings.limit) return { value: state.settings.limit, explicit: true };
@@ -1320,17 +1380,17 @@ function monthStats(mk, now = today()) {
   const daily = new Array(days + 1).fill(0);
   const recurDaily = new Array(days + 1).fill(0);
   const byCat = new Map(), recurByCat = new Map(), countByCat = new Map();
-  let spent = 0, income = 0, recurSpent = 0, largest = null, nIncome = 0, nExpense = 0;
+  let spent = 0, income = 0, recurSpent = 0, largest = null, largestSd = 0, nIncome = 0, nExpense = 0;
   const txs = state.tx.filter(t => t.date >= first && t.date <= last);
   for (const t of txs) {
     const c = cat(t.cat);
-    const sd = spendDelta(t.type, t.amount, c), id = incomeDelta(t.type, t.amount, c);
+    const sd = txSpend(t, c), id = txIncome(t, c);
     const day = +t.date.slice(8);
     if (sd) {
       spent += sd; daily[day] += sd;
       byCat.set(c.id, (byCat.get(c.id) || 0) + sd);
       if (t.rid) { recurSpent += sd; recurDaily[day] += sd; recurByCat.set(c.id, (recurByCat.get(c.id) || 0) + sd); }
-      if (sd > 0 && (!largest || sd > largest.amount)) largest = t;
+      if (sd > 0 && sd > largestSd) { largest = t; largestSd = sd; }
       if (sd > 0) nExpense++;
     }
     if (id) { income += id; if (id > 0) nIncome++; }
@@ -1387,7 +1447,7 @@ function monthStats(mk, now = today()) {
     mk, days, first, last, status, dayNum, daysLeft, txs, spent, income, net: income - spent,
     byCat, recurByCat, countByCat, recurSpent, upcoming, upSpend, upIncome, upByCat, upByDay,
     daily, recurDaily, cum, variable, rate, projected, projectionReady, limit, limitExplicit: lim ? lim.explicit : false,
-    ideal, projPath, largest, noSpendDays, nIncome, nExpense,
+    ideal, projPath, largest, largestSd, noSpendDays, nIncome, nExpense,
   };
   st.catRows = categoryRows(st);
   return st;
@@ -1432,7 +1492,7 @@ function monthBuckets(fromMk, toMk) {
     const b = map.get(t.date.slice(0, 7));
     if (!b) continue;
     const c = cat(t.cat);
-    const sd = spendDelta(t.type, t.amount, c), id = incomeDelta(t.type, t.amount, c);
+    const sd = txSpend(t, c), id = txIncome(t, c);
     b.spent += sd; b.income += id; b.n++;
     if (sd) b.byCat.set(c.id, (b.byCat.get(c.id) || 0) + sd);
   }
@@ -1759,8 +1819,31 @@ function defaultDateForMonth() {
 }
 
 /* ---------- entry form (inline on Overview and in the modal) ---------- */
-function newDraft(base = {}) { return { id: null, type: 'expense', amountText: '', note: '', cat: '', catAuto: false, date: defaultDateForMonth(), error: '', ...base }; }
-function draftFromTx(t) { return { id: t.id, type: t.type, amountText: amountToInput(t.amount), note: t.note, cat: t.cat, catAuto: false, date: t.date, error: '' }; }
+function newDraft(base = {}) { return { id: null, type: 'expense', amountText: '', note: '', cat: '', catAuto: false, date: defaultDateForMonth(), error: '', shared: false, owedText: '', pay: '', ...base }; }
+function draftFromTx(t) {
+  return { id: t.id, type: t.type, amountText: amountToInput(t.amount), note: t.note, cat: t.cat, catAuto: false, date: t.date, error: '',
+    shared: t.type === 'expense' && !!t.owed, owedText: t.owed ? amountToInput(t.owed) : '', pay: t.pay && payTarget(t) ? t.pay : '' };
+}
+/* "Your share" line under the shared-expense field. */
+function sharedNoteText(d) {
+  const a = parseAmount(d.amountText), o = parseAmount(d.owedText);
+  if (!(a > 0) || !(o > 0)) return 'Only your share will count as spending.';
+  if (o > a + 1e-9) return "That's more than the amount you paid.";
+  return `Your share: ${money(Math.round((a - o) * 100))}. The other ${money(Math.round(o * 100))} is tracked as owed to you.`;
+}
+/* Expenses a payment that came in could be paying back: open shared ones first, then recent expenses. */
+function repayTargets(d) {
+  const amt = Math.round((parseAmount(d.amountText) || 0) * 100);
+  const date = isYMD(d.date) ? d.date : today();
+  const open = sharedList().filter(x => x.t.id !== d.id && (x.open > 0 || x.t.id === d.pay));
+  const seen = new Set(open.map(x => x.t.id));
+  const from = addDays(date, -45), to = addDays(date, 1);
+  const recent = state.tx.filter(t => t.type === 'expense' && !seen.has(t.id) && t.id !== d.id && t.date >= from && t.date <= to
+      && ['expense', 'auto'].includes(cat(t.cat).kind) && (!amt || t.amount >= amt))
+    .sort((a, b) => b.date.localeCompare(a.date) || b.created - a.created).slice(0, 25);
+  if (d.pay && !seen.has(d.pay) && !recent.some(t => t.id === d.pay)) { const t = txIndex.get(d.pay); if (t) recent.unshift(t); }
+  return { open, recent };
+}
 
 function catsFor(type) {
   const from = addDays(today(), -120), to = today();
@@ -1778,7 +1861,30 @@ function entryFormHTML(d, ctx) {
     const on = d.cat === c.id;
     return `<button type="button" class="chip${on && d.catAuto ? ' auto' : ''}" role="radio" aria-checked="${on}" data-act="entry-cat" data-ctx="${ctx}" data-cat="${esc(c.id)}" data-key="${ctx}-cat-${esc(c.id)}"><span class="ico" aria-hidden="true">${esc(c.icon)}</span>${esc(c.name)}</button>`;
   }).join('');
-  const refundSel = d.type === 'income' && catIndex.get(d.cat)?.kind === 'expense' ? d.cat : '';
+  const refundSel = d.type === 'income' && !d.pay && catIndex.get(d.cat)?.kind === 'expense' ? d.cat : '';
+  let sharedBlock = '';
+  if (d.type === 'expense') {
+    sharedBlock = d.shared
+      ? `<div class="shared">
+          <div class="shared-row"><label for="${ctx}-owed">Friends pay me back</label><span class="money-in"><span>${esc(currencySymbol())}</span><input id="${ctx}-owed" type="text" name="owed" inputmode="decimal" value="${esc(d.owedText)}" placeholder="${decimalSep() === ',' ? '0,00' : '0.00'}" data-input="entry-field" data-ctx="${ctx}" data-key="${ctx}-owed"></span></div>
+          <div class="split" role="group" aria-label="Split the bill evenly"><span class="hint">or split evenly between</span>${[2, 3, 4, 5, 6].map(n => `<button type="button" class="chip sm" data-act="entry-split" data-ctx="${ctx}" data-n="${n}" data-key="${ctx}-split-${n}" aria-label="${n} people">${n}</button>`).join('')}</div>
+          <p class="hint shared-note">${esc(sharedNoteText(d))}</p>
+          <button type="button" class="link" data-act="entry-shared" data-ctx="${ctx}" data-on="0" data-key="${ctx}-shared-off">Not shared after all</button>
+        </div>`
+      : `<button type="button" class="link shared-link" data-act="entry-shared" data-ctx="${ctx}" data-on="1" data-key="${ctx}-shared-on">Paid for friends too? Track what they owe you</button>`;
+  }
+  let payBlock = '';
+  if (d.type === 'income') {
+    const { open, recent } = repayTargets(d);
+    if (open.length || recent.length) {
+      const o = (t, label) => `<option value="${esc(t.id)}"${t.id === d.pay ? ' selected' : ''}>${esc(label)}</option>`;
+      const name = t => (t.note || cat(t.cat).name).slice(0, 40);
+      payBlock = `<label class="refund">Or money back for <select data-change="entry-pay" data-ctx="${ctx}" data-key="${ctx}-pay" aria-label="Money back for an expense you paid for friends"><option value="">something you paid for friends…</option>
+        ${open.length ? `<optgroup label="Owed to you">${open.map(x => o(x.t, `${name(x.t)}, ${fmtDM(x.t.date)}, ${money(x.open)} owed`)).join('')}</optgroup>` : ''}
+        ${recent.length ? `<optgroup label="Recent expenses">${recent.map(t => o(t, `${name(t)}, ${fmtDM(t.date)}, ${money(t.amount)}`)).join('')}</optgroup>` : ''}
+      </select></label>`;
+    }
+  }
   const t = d.id ? state.tx.find(x => x.id === d.id) : null;
   let origin = '';
   if (t && t.rid) { const r = state.recurring.find(x => x.id === t.rid); origin = `Added by the recurring payment “${esc(r ? r.note || cat(r.cat).name : 'deleted')}”. Changes here affect only this entry.`; }
@@ -1796,6 +1902,7 @@ function entryFormHTML(d, ctx) {
     <input type="text" class="note-in" name="note" list="note-suggestions" maxlength="200" placeholder="${d.type === 'income' ? 'Where is it from?' : 'What was it for?'}" value="${esc(d.note)}" aria-label="Description" data-input="entry-field" data-ctx="${ctx}" data-key="${ctx}-note">
     <div class="chips" role="radiogroup" aria-label="Category">${chips}</div>
     ${d.type === 'income' ? `<label class="refund">Or a refund of <select data-change="entry-refund" data-ctx="${ctx}" data-key="${ctx}-refund" aria-label="Refund of a spending category"><option value="">a spending category…</option>${catOptions(refundSel, { kinds: ['expense'] })}</select></label>` : ''}
+    ${payBlock}${sharedBlock}
     ${origin ? `<p class="entry-origin">${origin}</p>` : ''}
     <p class="form-error" role="alert"${d.error ? '' : ' hidden'}>${esc(d.error)}</p>
     <div class="entry-actions">
@@ -1817,13 +1924,19 @@ function refreshEntryForm(ctx, focusKey) {
 function syncChips(ctx) {
   const host = entryHost(ctx), d = ui.drafts[ctx];
   if (!host) return;
-  for (const b of $$('.chip', host)) {
-    const on = b.dataset.cat === d.cat;
+  for (const b of $$('.chip[data-cat]', host)) {
+    const on = b.dataset.cat === d.cat && !d.pay;
     b.setAttribute('aria-checked', String(on));
     b.classList.toggle('auto', on && d.catAuto);
   }
   const sel = host.querySelector('[data-change="entry-refund"]');
-  if (sel) sel.value = catIndex.get(d.cat)?.kind === 'expense' ? d.cat : '';
+  if (sel) sel.value = !d.pay && catIndex.get(d.cat)?.kind === 'expense' ? d.cat : '';
+  const pay = host.querySelector('[data-change="entry-pay"]');
+  if (pay) pay.value = d.pay || '';
+}
+function syncSharedNote(ctx) {
+  const p = entryHost(ctx)?.querySelector('.shared-note');
+  if (p) p.textContent = sharedNoteText(ui.drafts[ctx]);
 }
 
 function openEntryModal(t = null) {
@@ -1841,26 +1954,56 @@ ACT['entry-type'] = el => {
   d.type = el.dataset.type;
   const c = catIndex.get(d.cat);
   if (c && !(c.kind === 'transfer' || (d.type === 'expense' && c.kind === 'expense') || (d.type === 'income' && c.kind === 'income'))) { d.cat = ''; d.catAuto = false; }
+  if (d.type === 'expense') d.pay = '';
   d.error = '';
   refreshEntryForm(el.dataset.ctx, `${el.dataset.ctx}-type-${d.type}`);
 };
 ACT['entry-cat'] = el => {
   const d = ui.drafts[el.dataset.ctx];
   if (!d) return;
-  d.cat = el.dataset.cat; d.catAuto = false;
+  d.cat = el.dataset.cat; d.catAuto = false; d.pay = '';
   if (d.error) { d.error = ''; const p = entryHost(el.dataset.ctx)?.querySelector('.form-error'); if (p) p.hidden = true; }
   syncChips(el.dataset.ctx);
 };
 CHANGE['entry-refund'] = el => {
   const d = ui.drafts[el.dataset.ctx];
   if (!d) return;
-  d.cat = el.value || ''; d.catAuto = false;
+  d.cat = el.value || ''; d.catAuto = false; d.pay = '';
   syncChips(el.dataset.ctx);
+};
+CHANGE['entry-pay'] = el => {
+  const d = ui.drafts[el.dataset.ctx];
+  if (!d) return;
+  const t = el.value ? txIndex.get(el.value) : null;
+  d.pay = t ? t.id : '';
+  if (t) { d.cat = cat(t.cat).kind === 'expense' ? t.cat : ''; d.catAuto = false; }
+  else d.cat = '';
+  if (d.error) { d.error = ''; const p = entryHost(el.dataset.ctx)?.querySelector('.form-error'); if (p) p.hidden = true; }
+  syncChips(el.dataset.ctx);
+};
+ACT['entry-shared'] = el => {
+  const ctx = el.dataset.ctx, d = ui.drafts[ctx];
+  if (!d) return;
+  d.shared = el.dataset.on === '1';
+  if (!d.shared) d.owedText = '';
+  d.error = '';
+  refreshEntryForm(ctx, d.shared ? `${ctx}-owed` : `${ctx}-shared-on`);
+};
+ACT['entry-split'] = el => {
+  const ctx = el.dataset.ctx, d = ui.drafts[ctx];
+  if (!d) return;
+  const host = entryHost(ctx), a = parseAmount(host.querySelector('[name="amount"]').value), n = +el.dataset.n;
+  if (!(a > 0)) return formError(ctx, 'Enter the amount you paid first.', 'amount');
+  d.owedText = amountToInput(Math.round(a * 100 * (n - 1) / n));
+  const inp = host.querySelector('[name="owed"]');
+  if (inp) inp.value = d.owedText;
+  syncSharedNote(ctx);
 };
 INPUT['entry-field'] = el => {
   const d = ui.drafts[el.dataset.ctx];
   if (!d) return;
-  if (el.name === 'amount') d.amountText = el.value;
+  if (el.name === 'amount') { d.amountText = el.value; syncSharedNote(el.dataset.ctx); }
+  else if (el.name === 'owed') { d.owedText = el.value; syncSharedNote(el.dataset.ctx); }
   else if (el.name === 'date') d.date = el.value;
   else if (el.name === 'note') {
     d.note = el.value;
@@ -1891,15 +2034,40 @@ SUBMIT['entry'] = form => {
   if (!Number.isFinite(v) || v <= 0) return formError(ctx, 'Enter an amount above zero, like 4,50.', 'amount');
   if (v >= 1e9) return formError(ctx, 'That amount is too large.', 'amount');
   if (!isYMD(d.date)) return formError(ctx, 'Pick a date.', 'date');
+  const cents = Math.round(v * 100);
+  const target = d.type === 'income' && d.pay ? txIndex.get(d.pay) : null;      // the expense this pays back
+  if (target && !d.cat) d.cat = 'uncat';
   if (!d.cat || !catIndex.has(d.cat)) return formError(ctx, 'Choose a category.');
-  const cents = Math.round(v * 100), c = cat(d.cat);
+  let owed = 0;
+  if (d.type === 'expense' && d.shared) {
+    d.owedText = form.elements.owed ? form.elements.owed.value : d.owedText;
+    const o = parseAmount(d.owedText);
+    if (!Number.isFinite(o) || o <= 0) return formError(ctx, 'Enter how much friends pay you back, or choose "Not shared after all".', 'owed');
+    owed = Math.round(o * 100);
+    if (owed > cents) return formError(ctx, "Friends can't owe more than the amount you paid.", 'owed');
+  }
+  const c = cat(d.cat);
   const when = d.date === today() ? '' : ` on ${fmtDayAuto(d.date)}`;
+  const apply = (s, t) => {
+    if (owed) { const got = sumBy(s.tx.filter(x => x.pay === t.id), x => x.amount); t.owed = Math.min(t.amount, Math.max(owed, got)); } else delete t.owed;
+    const exp = target ? s.tx.find(x => x.id === target.id) : null;
+    if (exp) linkRepayment(s, t, exp); else delete t.pay;
+  };
+  let backMsg = '';
+  if (target) {
+    const x = sharedList().find(r => r.t.id === target.id);
+    const total = (x ? x.back : 0) + cents;
+    const left = Math.max(0, Math.min(target.amount, Math.max(target.owed || 0, total)) - total);
+    backMsg = `${money(cents)} back for ${target.note || cat(target.cat).name}. ${left > 0 ? `${money(left)} is still owed.` : 'Nothing more is owed.'}`;
+  }
   if (d.id) {
     const id = d.id;
     form.closest('dialog')?.close('ok');
     commit(s => {
       const t = s.tx.find(x => x.id === id);
-      if (t) Object.assign(t, { date: d.date, amount: cents, type: d.type, cat: d.cat, note: d.note });
+      if (!t) return;
+      Object.assign(t, { date: d.date, amount: cents, type: d.type, cat: d.cat, note: d.note });
+      apply(s, t);
     }, 'Changes saved.');
     return;
   }
@@ -1907,7 +2075,10 @@ SUBMIT['entry'] = form => {
   if (ctx === 'modal') form.closest('dialog')?.close('ok');
   else ui.drafts.inline = newDraft({ type: d.type, date: d.date });
   const verb = d.type === 'income' ? (c.kind === 'expense' ? 'Refund of' : 'Income of') : 'Spent';
-  commit(s => s.tx.push(entry), `${verb} ${money(cents)} in ${c.name}${when}.`);
+  const msg = target ? backMsg
+    : owed ? `Your share of ${money(cents - owed)} is in ${c.name}${when}. ${money(owed)} is owed to you.`
+    : `${verb} ${money(cents)} in ${c.name}${when}.`;
+  commit(s => { s.tx.push(entry); apply(s, entry); }, msg);
   if (ctx === 'inline') $('[data-key="inline-amount"]')?.focus();
 };
 ACT['entry-delete'] = el => {
@@ -1937,7 +2108,7 @@ VIEWS.overview = {
       </div>
       <div class="ov-side">
         <section class="panel entry-panel o-entry" aria-labelledby="new-entry-h"><h2 id="new-entry-h">New entry</h2><div id="entry-inline">${entryFormHTML(ui.drafts.inline, 'inline')}</div></section>
-        ${empty ? '' : notesHTML(st) + upcomingHTML() + latestHTML(st)}
+        ${empty ? '' : notesHTML(st) + owedHTML() + upcomingHTML() + latestHTML(st)}
       </div>
     </div>`;
   },
@@ -2146,12 +2317,12 @@ function buildNotes(st) {
     }
   }
   const rv = reviewCount();
-  if (rv) out.push({ lvl: 'warn', html: `${plural(rv, 'pair')} of entries may count the same money twice (a transfer between your accounts, or a payment entered twice). <button class="link" data-act="review-open">Check them</button>` });
+  if (rv) out.push({ lvl: 'warn', html: `${plural(rv, 'pair')} of entries to check, so money isn't counted twice: possible transfers, duplicates or money back from friends. <button class="link" data-act="review-open">Check them</button>` });
   const uncat = st.txs.filter(t => t.cat === 'uncat').length;
   if (uncat) out.push({ lvl: 'info', html: `${plural(uncat, 'entry', 'entries')} this month ${uncat === 1 ? 'needs' : 'need'} a category. <button class="link" data-act="review-uncat">Sort them</button>` });
   const fixed = recurringMonthlySpend();
   if (fixed > 0 && st.limit) out.push({ lvl: 'info', html: `Recurring payments take about ${money(fixed, { whole: true })} a month, ${Math.round(fixed / st.limit * 100)}% of your limit.` });
-  if (st.largest && st.largest.amount >= 2000) out.push({ lvl: 'info', html: `Largest expense: ${money(st.largest.amount)} for ${esc(st.largest.note || cat(st.largest.cat).name)} on ${esc(fmtDM(st.largest.date))}.` });
+  if (st.largest && st.largestSd >= 2000) out.push({ lvl: 'info', html: `Largest expense: ${money(st.largestSd)} for ${esc(st.largest.note || cat(st.largest.cat).name)} on ${esc(fmtDM(st.largest.date))}.` });
   if (st.status === 'current' && st.dayNum >= 5 && st.noSpendDays > 0) out.push({ lvl: 'good', html: `${plural(st.noSpendDays, 'day')} with no spending so far this month.` });
   const order = { crit: 0, warn: 1, good: 2, info: 3 };
   return out.sort((a, b) => order[a.lvl] - order[b.lvl]).slice(0, 6);
@@ -2182,8 +2353,8 @@ function upcomingHTML() {
 function latestHTML(st) {
   const list = [...st.txs].sort((a, b) => b.date.localeCompare(a.date) || b.created - a.created).slice(0, 6);
   const rows = list.map(t => {
-    const c = cat(t.cat), inc = t.type === 'income', excluded = c.kind === 'transfer';
-    return `<button class="mini-row${excluded ? ' excluded' : ''}" data-act="edit-tx" data-id="${esc(t.id)}"><span class="ico" aria-hidden="true">${esc(c.icon)}</span><span class="mini-note">${esc(t.note || c.name)}<span class="mini-date">${esc(fmtDay(t.date))}${excluded ? ', not counted' : ''}</span></span><span class="mini-amt${inc && !excluded ? ' in' : ''}">${money(inc ? t.amount : -t.amount, { sign: inc })}</span></button>`;
+    const c = cat(t.cat), inc = t.type === 'income', back = !!(t.pay && payTarget(t)), excluded = c.kind === 'transfer' || back;
+    return `<button class="mini-row${excluded ? ' excluded' : ''}" data-act="edit-tx" data-id="${esc(t.id)}"><span class="ico" aria-hidden="true">${esc(c.icon)}</span><span class="mini-note">${esc(t.note || c.name)}<span class="mini-date">${esc(fmtDay(t.date))}${back ? ', money back' : excluded ? ', not counted' : t.owed ? `, your share ${money(t.amount - t.owed)}` : ''}</span></span><span class="mini-amt${inc && !excluded ? ' in' : ''}">${money(inc ? t.amount : -t.amount, { sign: inc })}</span></button>`;
   }).join('');
   return `<section class="panel o-latest"><div class="panel-head"><h2>Latest in ${esc(fmtMonthName(st.mk))}</h2></div>
     ${rows ? `<div class="mini">${rows}</div>` : '<p class="muted">No entries this month.</p>'}
@@ -2207,6 +2378,62 @@ ACT['set-budget'] = el => {
   setTimeout(() => { const inp = $(`[data-key="budget-${CSS.escape(id)}"]`); if (inp) { inp.focus(); inp.scrollIntoView({ block: 'center' }); } }, 30);
 };
 
+/* ---------- owed to you (shared expenses) ---------- */
+function owedHTML() {
+  const open = sharedOpen();
+  if (!open.length) return '';
+  const total = sumBy(open, x => x.open);
+  const rows = open.slice(0, 6).map(x => {
+    const c = cat(x.t.cat);
+    return `<button class="mini-row" data-act="owed-open" data-id="${esc(x.t.id)}"><span class="ico" aria-hidden="true">${esc(c.icon)}</span><span class="mini-note">${esc(x.t.note || c.name)}<span class="mini-date">${esc(fmtDayAuto(x.t.date))}${x.back ? `, ${money(x.back)} of ${money(x.owed)} back` : ''}</span></span><span class="mini-amt">${money(x.open)}</span></button>`;
+  }).join('');
+  return `<section class="panel o-owed"><div class="panel-head"><h2>Owed to you</h2><span class="aside">${money(total)} in all</span></div>
+    <div class="mini">${rows}</div>
+    ${open.length > 6 ? `<p class="hint" style="margin-top:8px">And ${open.length - 6} more.</p>` : ''}
+    <p class="hint" style="margin-top:8px">Not counted as your spending. Tap one when the money arrives.</p>
+  </section>`;
+}
+ACT['owed-open'] = el => {
+  const x = sharedList().find(r => r.t.id === el.dataset.id);
+  if (!x) return;
+  const t = x.t, name = t.note || cat(t.cat).name;
+  openModal({
+    title: name,
+    body: `<p>You paid ${money(t.amount)} on ${esc(fmtDayAuto(t.date))}. Your share is ${money(t.amount - t.owed)}; friends owe ${money(x.owed)}${x.back ? `, and ${money(x.back)} has come back` : ''}.</p>
+      <p><b>${money(x.open)}</b> is still owed.</p>
+      <div class="owed-actions">
+        <button type="button" class="btn primary" data-act="owed-paid" data-id="${esc(t.id)}" autofocus>The money came back</button>
+        <button type="button" class="btn" data-act="owed-edit" data-id="${esc(t.id)}">Change the expense</button>
+        <button type="button" class="btn danger" data-act="owed-forget" data-id="${esc(t.id)}">They won't pay it back</button>
+      </div>
+      <p class="hint" style="margin-top:10px">If you import bank statements, the incoming payment is matched for you, so you don't have to record it by hand.</p>`,
+  });
+};
+/* Opens the entry form ready to record the repayment. */
+ACT['owed-paid'] = el => {
+  const x = sharedList().find(r => r.t.id === el.dataset.id);
+  el.closest('dialog')?.close('ok');
+  if (!x) return;
+  setTimeout(() => {
+    ui.drafts.modal = newDraft({ type: 'income', amountText: amountToInput(x.open), note: `Money back: ${x.t.note || cat(x.t.cat).name}`.slice(0, 200), pay: x.t.id, cat: cat(x.t.cat).kind === 'expense' ? x.t.cat : '', date: today() });
+    openModal({ title: 'Money back', body: `<div id="entry-modal">${entryFormHTML(ui.drafts.modal, 'modal')}</div>`, onClose: () => { ui.drafts.modal = null; } });
+  }, 0);
+};
+ACT['owed-edit'] = el => {
+  const t = txIndex.get(el.dataset.id);
+  el.closest('dialog')?.close('ok');
+  if (t) setTimeout(() => openEntryModal(t), 0);
+};
+/* The rest becomes your own spending. */
+ACT['owed-forget'] = el => {
+  const x = sharedList().find(r => r.t.id === el.dataset.id);
+  el.closest('dialog')?.close('ok');
+  if (!x) return;
+  const id = x.t.id, back = x.back, open = x.open;
+  commit(s => { const t = s.tx.find(y => y.id === id); if (!t) return; if (back > 0) t.owed = Math.min(t.amount, back); else delete t.owed; },
+    `${money(open)} now counts as your own spending.`);
+};
+
 /* =========================================================================
    Entries: the ledger, with search and filters.
    ========================================================================= */
@@ -2217,7 +2444,7 @@ VIEWS.entries = {
     const all = filteredTx();
     const shown = all.slice(0, f.show);
     let spent = 0, income = 0;
-    for (const t of all) { const c = cat(t.cat); spent += spendDelta(t.type, t.amount, c); income += incomeDelta(t.type, t.amount, c); }
+    for (const t of all) { const c = cat(t.cat); spent += txSpend(t, c); income += txIncome(t, c); }
     const scopeTx = f.scope === 'all' ? state.tx : state.tx.filter(t => monthKey(t.date) === ui.month);
     const needsCount = scopeTx.filter(t => t.cat === 'uncat').length;
     const rvCount = reviewCount();
@@ -2237,7 +2464,7 @@ VIEWS.entries = {
       </select>
       ${state.accounts.length ? `<select data-change="f-acct" data-key="f-acct" aria-label="Account"><option value="">All accounts</option>${state.accounts.map(a => `<option value="${esc(a.id)}"${a.id === f.acct ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select>` : ''}
       ${needsCount || f.needs ? `<button type="button" class="toggle" aria-pressed="${f.needs}" data-act="f-needs" data-key="f-needs">Needs a category (${needsCount})</button>` : ''}
-      ${rvCount ? `<button type="button" class="toggle attn" data-act="review-open" data-key="f-review">Check double counting (${rvCount})</button>` : ''}
+      ${rvCount ? `<button type="button" class="toggle attn" data-act="review-open" data-key="f-review">To check (${rvCount})</button>` : ''}
       ${batch ? `<span class="pill">From ${esc(batch.file)}<button class="icon-btn" data-act="f-batch-clear" aria-label="Show all entries, not just this import">×</button></span>` : ''}
     </div>`;
 
@@ -2259,7 +2486,7 @@ VIEWS.entries = {
         if (g && g.date === t.date) g.items.push(t); else groups.push({ date: t.date, items: [t] });
       }
       const dayHtml = groups.map(g => {
-        const daySpend = sumBy(g.items, t => spendDelta(t.type, t.amount, cat(t.cat)));
+        const daySpend = sumBy(g.items, t => txSpend(t));
         return `<div class="day"><div class="day-head"><span>${esc(fmtDayAuto(g.date))}</span><span class="num">${daySpend ? `spent ${money(daySpend)}` : ''}</span></div>${g.items.map(txRowHTML).join('')}</div>`;
       }).join('');
       const more = all.length > shown.length ? `<div class="more"><button class="btn" data-act="f-more">Show ${Math.min(200, all.length - shown.length)} more of ${plural(all.length - shown.length, 'remaining entry', 'remaining entries')}</button></div>` : '';
@@ -2287,10 +2514,16 @@ function filteredTx() {
 
 function txRowHTML(t) {
   const c = cat(t.cat), inc = t.type === 'income';
-  const counted = spendDelta(t.type, t.amount, c) !== 0 || incomeDelta(t.type, t.amount, c) !== 0;
+  const counted = txSpend(t, c) !== 0 || txIncome(t, c) !== 0;
   let sub = '';
   if (c.kind === 'transfer') sub = 'Not counted';
   else if (inc && c.kind === 'expense') sub = 'Refund';
+  const target = t.pay ? payTarget(t) : null;
+  if (target) sub = `Money back for ${target.note || cat(target.cat).name}, not counted`;
+  else if (t.type === 'expense' && t.owed) {
+    const x = sharedList().find(r => r.t.id === t.id);
+    sub = `Shared: your share ${money(t.amount - t.owed)}, ${x && x.open > 0 ? `${money(x.open)} still owed` : 'paid back'}`;
+  }
   if (t.rid) sub = sub ? sub + ', recurring' : 'Recurring';
   else if (t.src === 'import') sub = sub ? sub + ', imported' : 'Imported';
   const an = t.acct ? (state.accounts.find(a => a.id === t.acct) || {}).name : '';
@@ -2318,7 +2551,7 @@ CHANGE['tx-cat'] = el => {
   if (!t || t.cat === el.value) return;
   const to = el.value, c = cat(to), note = t.note;
   const extra = note ? [{ label: 'Always do this', run: () => openRuleModal(note, to) }] : [];
-  setTimeout(() => commit(s => { const x = s.tx.find(y => y.id === t.id); if (x) x.cat = to; }, `Moved to ${c.name}.`, extra), 0);
+  setTimeout(() => commit(s => { const x = s.tx.find(y => y.id === t.id); if (x) { x.cat = to; delete x.pay; } }, `Moved to ${c.name}.`, extra), 0);
 };
 
 /* ---------- "always file X under Y" ---------- */
@@ -2466,7 +2699,7 @@ function topPlacesHTML(end) {
   for (const t of state.tx) {
     if (t.date < from || t.date > to) continue;
     const c = cat(t.cat);
-    const sd = spendDelta(t.type, t.amount, c);
+    const sd = txSpend(t, c);
     totalSpent += sd;
     if (sd <= 0 || !t.note) continue;
     const k = placeKey(t.note);
@@ -2502,7 +2735,7 @@ VIEWS.budgets = {
     const st = monthStats(ui.month);
     const prev = monthBuckets(shiftMonth(ui.month, -3), shiftMonth(ui.month, -1)).filter(b => b.n > 0);
     const avgOf = id => (prev.length ? sumBy(prev, b => b.byCat.get(id) || 0) / prev.length : null);
-    const incAvgOf = id => (prev.length ? sumBy(prev, b => sumBy(state.tx.filter(t => t.cat === id && monthKey(t.date) === b.mk), t => incomeDelta(t.type, t.amount, cat(t.cat)))) / prev.length : null);
+    const incAvgOf = id => (prev.length ? sumBy(prev, b => sumBy(state.tx.filter(t => t.cat === id && monthKey(t.date) === b.mk), t => txIncome(t))) / prev.length : null);
     const lim = state.settings.limit, sumB = budgetTotal(), fixed = recurringMonthlySpend();
     const mn = esc(fmtMonthName(ui.month));
     const cur = esc(currencySymbol());
@@ -2539,7 +2772,7 @@ VIEWS.budgets = {
 
     const incCats = state.categories.filter(c => c.kind === 'income');
     const incRows = incCats.map(c => {
-      const got = sumBy(st.txs.filter(t => t.cat === c.id), t => incomeDelta(t.type, t.amount, c)), avg = incAvgOf(c.id);
+      const got = sumBy(st.txs.filter(t => t.cat === c.id), t => txIncome(t, c)), avg = incAvgOf(c.id);
       return `<tr><td><span class="cell-name">${catNameInputs(c)}</span></td><td class="num hide-sm">${got ? money(got) : '<span class="muted">–</span>'}</td><td class="num hide-sm">${avg ? money(Math.round(avg), { whole: true }) : '<span class="muted">–</span>'}</td><td class="num">${deleteCatBtn(c)}</td></tr>`;
     }).join('');
     const trCats = state.categories.filter(c => c.kind === 'transfer');
@@ -3996,6 +4229,7 @@ function mergeStates(localState, incomingState) {
   const stats = { added: 0, updated: 0, removed: 0, same: 0 };
   const delA = A.deleted, delB = B.deleted;
   const gone = (bucket, key, x) => bucket[key] !== undefined && bucket[key] >= stampOf(x);
+  const renamed = new Map();          // entry ids that changed, so "money back for" links can follow
   // When the same thing was set up separately on both devices, both settle on the smaller id,
   // so later edits and deletions line up.
   const moveKey = (obj, from, to) => { if (obj[from] !== undefined) { obj[to] = Math.max(obj[to] || 0, obj[from]); delete obj[from]; } };
@@ -4012,7 +4246,7 @@ function mergeStates(localState, incomingState) {
   };
   const renameRec = (from, to) => {
     const pre = `r_${from}_`;
-    for (const t of A.tx) if (t.rid === from) { t.rid = to; if (t.id.startsWith(pre)) t.id = `r_${to}_` + t.id.slice(pre.length); }
+    for (const t of A.tx) if (t.rid === from) { t.rid = to; if (t.id.startsWith(pre)) { const nid = `r_${to}_` + t.id.slice(pre.length); renamed.set(t.id, nid); t.id = nid; } }
     for (const k of Object.keys(delA.tx)) if (k.startsWith(pre)) moveKey(delA.tx, k, `r_${to}_` + k.slice(pre.length));
     moveKey(delA.rec, from, to);
   };
@@ -4090,7 +4324,7 @@ function mergeStates(localState, incomingState) {
     if (b.acct) { const m = acctMap.get(b.acct); if (m) b.acct = m; else delete b.acct; }
     if (b.rid && ridMap.has(b.rid) && ridMap.get(b.rid) !== b.rid) {
       const to = ridMap.get(b.rid), pre = `r_${b.rid}_`;
-      if (b.id.startsWith(pre)) b.id = `r_${to}_` + b.id.slice(pre.length);
+      if (b.id.startsWith(pre)) { const nid = `r_${to}_` + b.id.slice(pre.length); renamed.set(b.id, nid); b.id = nid; }
       b.rid = to;
     }
     const a = byId.get(b.id);
@@ -4101,6 +4335,8 @@ function mergeStates(localState, incomingState) {
         Object.assign(a, { date: b.date, amount: b.amount, type: b.type, cat: b.cat, note: b.note, upd: b.upd });
         if (b.acct) a.acct = b.acct; else delete a.acct;
         if (b.bk) a.bk = b.bk; else delete a.bk;
+        if (b.owed) a.owed = b.owed; else delete a.owed;
+        if (b.pay) a.pay = b.pay; else delete a.pay;
         if (changed) stats.updated++; else stats.same++;
       } else stats.same++;
     } else if (gone(delA.tx, b.id, b)) stats.same++;
@@ -4119,7 +4355,10 @@ function mergeStates(localState, incomingState) {
     if (list && list.length) {
       const a = list.shift();
       if (b.bk && !a.bk) a.bk = b.bk;
-      if (b.id < a.id && !byId.has(b.id)) { byId.delete(a.id); a.id = b.id; byId.set(a.id, a); }   // both devices settle on one id
+      if (b.owed && !a.owed) a.owed = b.owed;
+      if (b.pay && !a.pay) a.pay = b.pay;
+      if (b.id < a.id && !byId.has(b.id)) { byId.delete(a.id); renamed.set(a.id, b.id); a.id = b.id; byId.set(a.id, a); }   // both devices settle on one id
+      else renamed.set(b.id, a.id);
       stats.same++;
     } else { A.tx.push(b); byId.set(b.id, b); stats.added++; }
   }
@@ -4127,6 +4366,7 @@ function mergeStates(localState, incomingState) {
   const drop = new Set();
   for (const [id, ts] of Object.entries(delB.tx)) { const a = byId.get(id); if (a && stampOf(a) <= ts) drop.add(id); }
   if (drop.size) { A.tx = A.tx.filter(t => !drop.has(t.id)); stats.removed += drop.size; }
+  for (const t of A.tx) if (t.pay && renamed.has(t.pay)) t.pay = renamed.get(t.pay);
 
   /* rules: one per piece of text; new ones from the other device go on top */
   const aRules = new Map(A.rules.map(r => [ruleKey(r), r]));
@@ -4335,28 +4575,56 @@ function reviewPairs() {
     usedT.add(p.a.id); usedT.add(p.b.id);
     transfers.push(p);
   }
+  /* money back from friends: a payment that came in and fits what is still owed on a shared expense */
+  const repays = [];
+  const openShared = sharedOpen();
+  if (openShared.length) {
+    const rc = [];
+    for (const x of openShared) {
+      for (const i of state.tx) {
+        if (i.type !== 'income' || i.pay || used.has(i.id) || usedT.has(i.id) || cat(i.cat).kind !== 'auto') continue;
+        const d = daysBetween(x.t.date, i.date);
+        if (d < -1 || d > 45 || i.amount > x.open) continue;
+        const exact = i.amount === x.open;
+        const evenShare = x.owed % i.amount === 0 && x.owed / i.amount <= 8;     // one of several equal shares
+        if (!exact && !evenShare && !tokensOf(norm(i.note)).has('iris')) continue;
+        const key = `p:${x.t.id}|${i.id}`;
+        if (!dismissed.has(key)) rc.push({ kind: 'p', a: x.t, b: i, key, score: (exact ? 0 : 100) + Math.abs(d) });
+      }
+    }
+    rc.sort((x, y) => x.score - y.score);
+    const left = new Map(openShared.map(x => [x.t.id, x.open])), usedP = new Set();
+    for (const p of rc) {
+      if (usedP.has(p.b.id) || left.get(p.a.id) < p.b.amount) continue;
+      usedP.add(p.b.id); left.set(p.a.id, left.get(p.a.id) - p.b.amount);
+      repays.push(p);
+    }
+  }
   const byDate = (x, y) => y.a.date.localeCompare(x.a.date);
-  reviewCache = { rev: dataRev, pairs: { dups: dups.sort(byDate), transfers: transfers.sort(byDate) } };
+  reviewCache = { rev: dataRev, pairs: { dups: dups.sort(byDate), transfers: transfers.sort(byDate), repays: repays.sort(byDate) } };
   return reviewCache.pairs;
 }
-function reviewCount() { const p = reviewPairs(); return p.dups.length + p.transfers.length; }
+function reviewCount() { const p = reviewPairs(); return p.dups.length + p.transfers.length + p.repays.length; }
 
 /* After an import or a merge: say so if something needs a look. */
 function offerReview() {
-  const p = reviewPairs(), n = p.dups.length + p.transfers.length;
+  const p = reviewPairs(), n = p.dups.length + p.transfers.length + p.repays.length;
   if (!n) return;
-  const what = [p.transfers.length && plural(p.transfers.length, 'possible transfer'), p.dups.length && plural(p.dups.length, 'possible duplicate')].filter(Boolean).join(' and ');
+  const what = [p.repays.length && plural(p.repays.length, 'possible repayment'), p.transfers.length && plural(p.transfers.length, 'possible transfer'), p.dups.length && plural(p.dups.length, 'possible duplicate')]
+    .filter(Boolean).join(', ').replace(/, ([^,]*)$/, ' and $1');
   toast(`${what} to check, so money isn't counted twice.`, [{ label: 'Review', run: openReviewModal }]);
 }
 
 function reviewRowHTML(t) {
   const c = cat(t.cat), inc = t.type === 'income';
   const where = t.src === 'import' ? (acctName(t) || 'Imported') : t.rid ? 'Recurring payment' : 'Typed by you';
-  return `<div class="rv-row"><span class="ico" aria-hidden="true">${esc(c.icon)}</span><span class="rv-note">${esc(t.note || c.name)}<span class="rv-sub">${esc(fmtDayAuto(t.date))}, ${esc(where)}, ${esc(c.name)}</span></span><span class="rv-amt${inc ? ' in' : ''}">${money(inc ? t.amount : -t.amount, { sign: inc })}</span></div>`;
+  const x = t.type === 'expense' && t.owed ? sharedList().find(r => r.t.id === t.id) : null;
+  const extra = x ? `, ${money(x.open)} still owed to you` : '';
+  return `<div class="rv-row"><span class="ico" aria-hidden="true">${esc(c.icon)}</span><span class="rv-note">${esc(t.note || c.name)}<span class="rv-sub">${esc(fmtDayAuto(t.date))}, ${esc(where)}, ${esc(c.name)}${extra}</span></span><span class="rv-amt${inc ? ' in' : ''}">${money(inc ? t.amount : -t.amount, { sign: inc })}</span></div>`;
 }
 function reviewBodyHTML() {
   const p = reviewPairs();
-  if (!p.dups.length && !p.transfers.length) return '<p>Nothing left to check.</p>';
+  if (!p.dups.length && !p.transfers.length && !p.repays.length) return '<p>Nothing left to check.</p>';
   const section = (title, lede, list, yes, no, allLabel, allAct) => {
     if (!list.length) return '';
     const items = list.slice(0, 30).map(x => `<div class="rv-pair">${reviewRowHTML(x.a)}${reviewRowHTML(x.b)}
@@ -4365,11 +4633,12 @@ function reviewBodyHTML() {
       ${list.length > 30 ? `<p class="hint">Showing 30 of ${list.length}.</p>` : ''}
       ${list.length > 1 ? `<div class="rv-all"><button type="button" class="btn sm" data-act="${allAct}">${allLabel} (${list.length})</button></div>` : ''}</section>`;
   };
-  return section('Transfers between your accounts', 'The same amount left one account and arrived in another. As a transfer, neither side counts as spending or income.', p.transfers, "It's a transfer", 'Not a transfer', 'All of these are transfers', 'rv-all-t')
+  return section('Money back from friends', "A payment came in that fits something you paid for friends. Matched, it settles what you're owed and isn't counted as income.", p.repays, "Yes, it's for this", 'No, something else', 'All of these are repayments', 'rv-all-p')
+    + section('Transfers between your accounts', 'The same amount left one account and arrived in another. As a transfer, neither side counts as spending or income.', p.transfers, "It's a transfer", 'Not a transfer', 'All of these are transfers', 'rv-all-t')
     + section('The same payment twice', 'An entry you added and a row from a statement look like one payment. Keeping one removes the statement row and keeps your entry.', p.dups, 'Same payment, keep one', 'Two different payments', 'All of these are the same payment', 'rv-all-d');
 }
 function openReviewModal() {
-  openModal({ title: 'Check for double counting', wide: true, body: `<div id="review-body">${reviewBodyHTML()}</div>`, foot: '<button type="button" class="btn" data-act="modal-close">Done</button>' });
+  openModal({ title: 'Things to check', wide: true, body: `<div id="review-body">${reviewBodyHTML()}</div>`, foot: '<button type="button" class="btn" data-act="modal-close">Done</button>' });
 }
 function refreshReview() {
   const host = $('#review-body');
@@ -4386,7 +4655,12 @@ function resolvePairs(list, yes) {
   if (!list.length) return;
   const kind = list[0].kind;
   if (!yes) {
-    commit(s => { s.dismissed = [...s.dismissed, ...list.map(p => p.key)].slice(-3000); }, kind === 't' ? 'Left as it is.' : 'Kept both.');
+    commit(s => { s.dismissed = [...s.dismissed, ...list.map(p => p.key)].slice(-3000); }, kind === 'd' ? 'Kept both.' : 'Left as it is.');
+  } else if (kind === 'p') {
+    commit(s => {
+      const byId = new Map(s.tx.map(t => [t.id, t]));
+      for (const p of list) { const exp = byId.get(p.a.id), pay = byId.get(p.b.id); if (exp && pay) linkRepayment(s, pay, exp); }
+    }, `${plural(list.length, 'payment')} matched to what you were owed.`);
   } else if (kind === 't') {
     commit(s => {
       const to = transferCatId(s), ids = new Set(list.flatMap(p => [p.a.id, p.b.id]));
@@ -4408,11 +4682,12 @@ function resolvePairs(list, yes) {
   }
   refreshReview();
 }
-const findPair = key => { const p = reviewPairs(); return [...p.dups, ...p.transfers].find(x => x.key === key); };
+const findPair = key => { const p = reviewPairs(); return [...p.dups, ...p.transfers, ...p.repays].find(x => x.key === key); };
 ACT['rv-yes'] = el => { const p = findPair(el.dataset.pair); if (p) resolvePairs([p], true); };
 ACT['rv-no'] = el => { const p = findPair(el.dataset.pair); if (p) resolvePairs([p], false); };
 ACT['rv-all-t'] = () => resolvePairs(reviewPairs().transfers, true);
 ACT['rv-all-d'] = () => resolvePairs(reviewPairs().dups, true);
+ACT['rv-all-p'] = () => resolvePairs(reviewPairs().repays, true);
 
 /* =========================================================================
    Start-up
@@ -4449,7 +4724,7 @@ function handleAddShortcut() {
 async function boot() {
   state = await loadState();
   reindex();
-  if (runRecurring(state) || store.resync) persist();
+  if (runRecurring(state) || store.resync) { reindex(); persist(); }
   applyTheme();
   route();
   render();
@@ -4473,7 +4748,7 @@ async function boot() {
     if (t !== lastDay) {
       if (monthKey(lastDay) === ui.month) ui.month = monthKey(t);
       lastDay = t;
-      if (runRecurring(state)) persist();
+      if (runRecurring(state)) { reindex(); persist(); }
       render();
     }
   });

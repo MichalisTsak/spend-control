@@ -5,6 +5,7 @@ A private spending tracker that runs in your browser and installs on your phone 
 - Your entries are stored only on the device you use it on. Nothing is uploaded, and there is no server or account.
 - Works offline once installed.
 - Monthly limit, category budgets, recurring payments, trends, and bank statement import (CSV or Excel, including Greek bank layouts and Revolut).
+- Shared expenses: when you pay for friends, only your share counts, and the app tracks what you're owed and matches the money when it comes back.
 - Guards against counting money twice: statement rows are matched to entries you typed and to recurring payments, and transfers between your own accounts are paired for you to confirm.
 - Phone and computer can be combined by merging backups.
 
